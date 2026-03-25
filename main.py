@@ -1,3 +1,15 @@
+# Copyright 2026 J Joe
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#    http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import random
 import tempfile
 import argparse
 import json
@@ -15,29 +27,39 @@ import mlx.core as mx
 import mlx_lm
 from mlx_lm.generate import generate_step
 
-prompt_cache = {}
-logging.basicConfig(filename="mlx_trace.log", filemode='w', level=logging.DEBUG, format="%(message)s") # format="【\n%(message)s\n】\n")
-logger = logging.getLogger(__name__)
+stream_logger = logging.getLogger("stream")
+stream_logger.setLevel(logging.DEBUG)
+s_handler = logging.FileHandler("mlx_stream.log", mode='w')
+s_handler.setFormatter(logging.Formatter("%(message)s"))
+s_handler.terminator = ""
+stream_logger.addHandler(s_handler)
+trace_logger = logging.getLogger("trace")
+trace_logger.setLevel(logging.DEBUG)
+t_handler = logging.FileHandler("mlx_trace.log", mode='w')
+t_handler.setFormatter(logging.Formatter("【%(message)s\n】\n"))
+trace_logger.addHandler(t_handler)
 gen_lock = threading.Lock()
+prompt_cache = {}
 
 def parse_tool(tools, names):
     qwen_tools = []
     for tool in tools:
-        if tool["name"] in names:
-            qwen_tool = {
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool.get("input_schema", {
-                        "type": "object",
-                        "properties": {}
-                    })
-                }
+        if names is not None and tool["name"] not in names:
+            continue
+        qwen_tool = {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool.get("input_schema", {
+                    "type": "object",
+                    "properties": {}
+                })
             }
-            params = qwen_tool["function"]["parameters"]
-            params.pop("$schema", None)
-            qwen_tools.append(qwen_tool)
+        }
+        params = qwen_tool["function"]["parameters"]
+        params.pop("$schema", None)
+        qwen_tools.append(qwen_tool)
     return qwen_tools
 
 def encode(body, tokenizer, system, names, skips):
@@ -62,7 +84,7 @@ def encode(body, tokenizer, system, names, skips):
     if sys_parts:
         msgs.append({"role": "system", "content": "\n\n".join(sys_parts)})
     calls = {}
-    def skip(text, show_skipped=False):
+    def skip(text, show_skipped=True):
         if skips is None:
             return text
         lines = []
@@ -71,10 +93,10 @@ def encode(body, tokenizer, system, names, skips):
             if found:
                 lines.append(
                     f"{pattern}\n" +
-                    "\n".join(re.sub(r"\S", ".", m) for m in found)
+                    "\n".join(found)
                 )
         if lines and show_skipped:
-            logger.debug("\n".join(lines))
+            trace_logger.debug("\n".join(["S"]+lines))
         for pattern in skips:
             text = re.sub(pattern, "", text)
         return text
@@ -97,7 +119,7 @@ def encode(body, tokenizer, system, names, skips):
                 rc = block.get("content", "")
                 if isinstance(rc, list):
                     rc = skip("\n".join(c.get("text", "") for c in rc if c.get("type") == "text"))
-                parts |= {"role": "tool", "name": tu['name'], "content": f"{tu['input']}\n{rc}"} 
+                msgs.append({"role": "tool", "name": tu['name'], "content": f"{tu['input']}\n{rc}"})
         if parts:
             msgs.append({"role": role}|parts)
     if not msgs[-1].get('content', '').strip():
@@ -125,7 +147,6 @@ def decode(raw_text, tokenizer, parse_think=True):
                 content = match.group(1).strip()
                 if not ("<function=" in content and "<parameter=" in content and "</parameter>" in content):
                     continue
-
                 fn_match = re.search(r"<function=([^\s>]+)>", content)
                 if fn_match:
                     name = fn_match.group(1)
@@ -175,20 +196,23 @@ def blocks_to_sse(blocks: list[dict], msg_id: str, in_tokens: int, out_tokens: i
     return bytes(out)
 
 def dmca(p_str):
+    symbols = ["▲", "△", "▶", "▷", "▼", "▽", "◀", "◁", "◆", "◇"]
+    def mask_text(text):
+        return re.sub(r"\S", lambda _: random.choice(symbols), text)
     pattern1 = r"(<\|im_start\|>system\n)(.*?)(<\|im_end\|>)"
     def mask_system(match):
-        return match.group(1) + re.sub(r"\S", ".", match.group(2)) + match.group(3)
+        return match.group(1) + mask_text(match.group(2)) + match.group(3)
     p_str = re.sub(pattern1, mask_system, p_str, flags=re.DOTALL)
     block_patterns = [
         r"(?m)^<system-reminder>[\s\S]*?^</system-reminder>\s*",
         r"(?m)^\[SUGGESTION MODE[\s\S]*",
     ]
     for pattern in block_patterns:
-        p_str = re.sub(pattern, lambda m: re.sub(r"\S", ".", m.group(0)), p_str)
+        p_str = re.sub(pattern, lambda m: mask_text(m.group(0)), p_str)
     return p_str
 
 def generate(model, tokenizer, prompt, hook=None, max_tokens=256, helper_max_tokens=64, **kwargs):
-    global prompt_cache, hx
+    global prompt_cache
     if prompt is None:
         return '', 0, 0
     if not isinstance(tokenizer, mlx_lm.tokenizer_utils.TokenizerWrapper):
@@ -200,8 +224,7 @@ def generate(model, tokenizer, prompt, hook=None, max_tokens=256, helper_max_tok
         prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
     else:
         prompt_s = tokenizer.decode(prompt)
-    logger.debug(dmca(prompt_s))
-    stream = logging.getLogger().handlers[0].stream
+    stream_logger.debug(dmca(prompt_s))
     common_len = 0
     if prompt_cache.get('cache', None):
         for p, h in zip(prompt, prompt_cache['hx']):
@@ -212,9 +235,8 @@ def generate(model, tokenizer, prompt, hook=None, max_tokens=256, helper_max_tok
     else:
         prompt_cache['hx'] = []
         prompt_cache['cache'] = mlx_lm.models.cache.make_prompt_cache(model)
-    trim_amount = len(prompt_cache['hx']) - common_len
-    mlx_lm.models.cache.trim_prompt_cache(prompt_cache['cache'], trim_amount)
-    prompt_cache['hx'] = prompt_cache['hx'][:common_len]
+    trim_len = len(prompt_cache['hx']) - common_len
+    mlx_lm.models.cache.trim_prompt_cache(prompt_cache['cache'], trim_len)
     token_gen = generate_step(
         mx.array(prompt[common_len:]),
         model,
@@ -231,20 +253,20 @@ def generate(model, tokenizer, prompt, hook=None, max_tokens=256, helper_max_tok
             break
         detokenizer.add_token(token)
         seg = detokenizer.last_segment
-        stream.write(seg)
-        stream.flush()
+        stream_logger.debug(seg)
         text += seg
         if len(gens) == 1:
             tic_inp = time.perf_counter()
-            if len(prompt_cache['hx']) ==0:
-                mlx_lm.models.cache.save_prompt_cache(prompt_cache['file_name'], prompt_cache['cache'], metadata=dict(model_name=prompt_cache['model_name'], hx=json.dumps(prompt)))
+            if prompt_cache.get('file_name'): 
+                _fn = prompt_cache.pop('file_name')
+                mlx_lm.models.cache.save_prompt_cache(_fn, prompt_cache['cache'], metadata=dict(model_name=prompt_cache['model_name'], hx=json.dumps(prompt)))
         if len(gens) >= max_tokens:
             break
     tic_out = time.perf_counter()
     detokenizer.finalize()
     text += detokenizer.last_segment
     prompt_cache['hx'] = prompt+gens
-    logger.debug(f'{len(prompt)} in {tic_inp-tic_non:.0f}; {len(gens)} in {tic_out-tic_inp:.0f}; {common_len}\n=== INP ===\n{dmca(prompt_s)}\n=== OUT ===\n{text}\n')
+    trace_logger.debug(f'G {common_len} {trim_len}\n=== TPS ===\n- Processed {len(prompt)} input tokens in {tic_inp-tic_non:.0f} seconds ({len(prompt)/(tic_inp-tic_non):.0f} tokens per second)\n- Generated {len(gens)} new tokens in {tic_out-tic_inp:.0f} seconds ({len(gens)/(tic_out-tic_inp):.0f} tokens per second)\n\n=== INP ===\n{prompt_s}\n=== OUT ===\n{text}')
     return text, len(prompt), len(gens)
 
 def make_handler(model, tokenizer, system, names, skips, parse_think=True):
@@ -300,13 +322,14 @@ def main():
     parser.add_argument("--model", default="mlx-community/Qwen3.5-4B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-2B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-0.8B-MLX-bf16")
-    parser.add_argument("--system", type=str, default=None)
-    # parser.add_argument("--system", type=str, default='# Env\n{env}')
+    parser.add_argument("--system", type=str, default='# Env\n{env}')
+    # parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--cache", type=str, default='cache/cache.safetensors')
     parser.add_argument("--names", nargs="+", default=['Read','Edit','Write','Grep','Glob','Bash','Agent','Skill'])
+    # parser.add_argument("--names", nargs="+", default=None)
     parser.add_argument("--skips", nargs="+", default=[
         r'(?m)^\[SUGGESTION MODE[\s\S]*'
-        # r'(?m)^<system-reminder>[\s\S]*?^</system-reminder>\s*',
+        r'(?m)^<system-reminder>[\s\S]*?^</system-reminder>\s*',
     ])
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="127.0.0.1")
