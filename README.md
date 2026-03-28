@@ -28,19 +28,7 @@ mlx-code [options] [-- claude options]
 | `--work` | `$CWD` | Working directory mirrored into the Claude session |
 | `--home` | temp dir | Home directory for the Claude process |
 
-Any extra arguments after `--` are forwarded to the `claude` CLI:
-
-| Command | What it does | Example |
-|--------|--------------|--------|
-| `mlx-code` | Start interactive mode | `mlx-code` |
-| `mlx-code "task"` | Run a one-time task | `mlx-code "fix the build error"` |
-| `mlx-code -p "query"` | Run one-off query, then exit | `mlx-code -p "explain this function"` |
-| `mlx-code -c` | Continue most recent conversation in current directory | `mlx-code -c` |
-| `mlx-code -r` | Resume a previous conversation | `mlx-code -r` |
-| `mlx-code commit` | Create a Git commit | `mlx-code commit` |
-| `/clear` | Clear conversation history | `/clear` |
-| `/help` | Show available commands | `/help` |
-| `exit` or `Ctrl+C` | Exit Claude Code | `exit` |
+Any extra arguments after `--` are forwarded to the `claude` CLI
 
 ### Licence
 
