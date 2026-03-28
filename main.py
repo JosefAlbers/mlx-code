@@ -47,17 +47,18 @@ def parse_tool(tools, names):
         if names is not None and tool["name"] not in names:
             continue
         qwen_tool = {
-            "type": "function",
-            "function": {
+            # "type": "function",
+            # "function": {
                 "name": tool["name"],
                 "description": tool["description"],
                 "parameters": tool.get("input_schema", {
                     "type": "object",
                     "properties": {}
                 })
-            }
+            # }
         }
-        params = qwen_tool["function"]["parameters"]
+        # params = qwen_tool["function"]["parameters"]
+        params = qwen_tool["parameters"]
         params.pop("$schema", None)
         qwen_tools.append(qwen_tool)
     return qwen_tools
@@ -77,24 +78,21 @@ def encode(body, tokenizer, system, names, skips):
                 if block.get("type") != "text":
                     continue
                 text = block.get("text", "").strip()
-                if re.match(r'^\S+:\s', text) and '\n' not in text:
+                if re.match(r'^x-anthropic-billing-header:\s?.*;$', text) and '\n' not in text:
                     continue
                 if text:
                     sys_parts.append(text)
     if sys_parts:
         msgs.append({"role": "system", "content": "\n\n".join(sys_parts)})
     calls = {}
-    def skip(text, show_skipped=True):
+    def skip(text, show_skipped=False):
         if skips is None:
             return text
         lines = []
         for pattern in skips:
             found = re.findall(pattern, text)
             if found:
-                lines.append(
-                    f"{pattern}\n" +
-                    "\n".join(found)
-                )
+                lines.append(f"{pattern}\n" + "\n".join(found))
         if lines and show_skipped:
             trace_logger.debug("\n".join(["S"]+lines))
         for pattern in skips:
@@ -109,7 +107,7 @@ def encode(body, tokenizer, system, names, skips):
         for block in content:
             t = block.get("type")
             if t == "text":
-                parts['content'] = parts.get('content', '').rstrip() + '\n' + skip(block['text']).rstrip()
+                parts['content'] = parts.get('content', '') + skip(block['text'])
             elif t == "thinking":
                 parts['reasoning_content'] = block['thinking']
             elif t == "tool_use":
@@ -126,22 +124,31 @@ def encode(body, tokenizer, system, names, skips):
         return None
     return tokenizer.apply_chat_template(msgs, tools = parse_tool(body.get("tools", []), names), tokenize=False, add_generation_prompt=True)
 
-def decode(raw_text, tokenizer, parse_think=True):
+def decode(raw_text, tokenizer, parse_think, single_think=False):
+    # think_id = tokenizer.convert_tokens_to_ids("<think>")
+    def escape(text):
+        def repl(match):
+            inner = match.group(1)
+            inner = inner.replace('<', '‹').replace('>', '›')
+            return f'`{inner}`'
+        return re.sub(r'`([^\n`]*)`', repl, text)
+    raw_text = escape(raw_text)
     raw_text = '<think>' + raw_text if (c := raw_text.find('</think>')) != -1 and ((o := raw_text.find('<think>')) == -1 or c < o) else raw_text
     blocks = []
     if parse_think:
-        parts = re.split(r'(<think>.*?</think>)', raw_text, flags=re.DOTALL)
+        parts = re.split(r'(<think>.*?</think>)', raw_text, flags=re.DOTALL, maxsplit=1 if single_think else 0)
     else:
         parts = [raw_text]
+
     for part in parts:
         if not part:
-            continue
-        if parse_think and part.startswith('<think>') and part.endswith('</think>'):
+            continue 
+        if parse_think and not single_think and part.startswith('<think>') and part.endswith('</think>'):
             thinking_content = part[7:-8].strip()
             if thinking_content:
                 blocks.append({"type": "thinking", "thinking": thinking_content})
         else:
-            blocks.append({"type": "text", "text": part})
+            blocks.append({"type": "text", "text": re.sub(r'</?think>', '‹think›', part)}) #: show tool call
             tool_pattern = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
             for match in tool_pattern.finditer(part):
                 content = match.group(1).strip()
@@ -232,10 +239,12 @@ def generate(model, tokenizer, prompt, hook=None, max_tokens=256, helper_max_tok
                 common_len += 1
             else:
                 break
+        common_len = min(common_len, len(prompt) - 1)
     else:
         prompt_cache['hx'] = []
         prompt_cache['cache'] = mlx_lm.models.cache.make_prompt_cache(model)
-    trim_len = len(prompt_cache['hx']) - common_len
+    hx_len = len(prompt_cache['hx']) 
+    trim_len = hx_len - common_len
     mlx_lm.models.cache.trim_prompt_cache(prompt_cache['cache'], trim_len)
     token_gen = generate_step(
         mx.array(prompt[common_len:]),
@@ -259,14 +268,14 @@ def generate(model, tokenizer, prompt, hook=None, max_tokens=256, helper_max_tok
             tic_inp = time.perf_counter()
             if prompt_cache.get('file_name'): 
                 _fn = prompt_cache.pop('file_name')
-                mlx_lm.models.cache.save_prompt_cache(_fn, prompt_cache['cache'], metadata=dict(model_name=prompt_cache['model_name'], hx=json.dumps(prompt)))
+                mlx_lm.models.cache.save_prompt_cache(_fn, prompt_cache['cache'], metadata=dict(model_name=prompt_cache['model_name'], hx=json.dumps(prompt+gens)))
         if len(gens) >= max_tokens:
             break
     tic_out = time.perf_counter()
     detokenizer.finalize()
     text += detokenizer.last_segment
     prompt_cache['hx'] = prompt+gens
-    trace_logger.debug(f'G {common_len} {trim_len}\n=== TPS ===\n- Processed {len(prompt)} input tokens in {tic_inp-tic_non:.0f} seconds ({len(prompt)/(tic_inp-tic_non):.0f} tokens per second)\n- Generated {len(gens)} new tokens in {tic_out-tic_inp:.0f} seconds ({len(gens)/(tic_out-tic_inp):.0f} tokens per second)\n\n=== INP ===\n{prompt_s}\n=== OUT ===\n{text}')
+    trace_logger.debug(f'G {hx_len} {len(prompt)} {common_len} {trim_len} {len(gens)}\n=== TPS ===\n- Processed {len(prompt)} input tokens in {tic_inp-tic_non:.0f} seconds ({len(prompt)/(tic_inp-tic_non):.0f} tokens per second)\n- Generated {len(gens)} new tokens in {tic_out-tic_inp:.0f} seconds ({len(gens)/(tic_out-tic_inp):.0f} tokens per second)\n\n=== INP ===\n{dmca(prompt_s)}\n=== OUT ===\n{text}')
     return text, len(prompt), len(gens)
 
 def make_handler(model, tokenizer, system, names, skips, parse_think=True):
@@ -322,13 +331,15 @@ def main():
     parser.add_argument("--model", default="mlx-community/Qwen3.5-4B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-2B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-0.8B-MLX-bf16")
-    parser.add_argument("--system", type=str, default='# Env\n{env}')
+    parser.add_argument("--system", type=str, default='')
+    # parser.add_argument("--system", type=str, default='# Env\n{env}')
     # parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--cache", type=str, default='cache/cache.safetensors')
+    # parser.add_argument("--names", nargs="+", default=[])
     parser.add_argument("--names", nargs="+", default=['Read','Edit','Write','Grep','Glob','Bash','Agent','Skill'])
     # parser.add_argument("--names", nargs="+", default=None)
     parser.add_argument("--skips", nargs="+", default=[
-        r'(?m)^\[SUGGESTION MODE[\s\S]*'
+        r'(?m)^\[SUGGESTION MODE[\s\S]*',
         r'(?m)^<system-reminder>[\s\S]*?^</system-reminder>\s*',
     ])
     parser.add_argument("--port", type=int, default=8000)
