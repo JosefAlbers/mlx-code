@@ -6,7 +6,7 @@ setup(
     author_email="albersj66@gmail.com",
     author="J Joe",
     license="Apache-2.0",
-    version="0.0.2a1",
+    version="0.0.2a2",
     readme="README.md",
     description="Local Claude Code for Mac",
     long_description=open("README.md").read(),

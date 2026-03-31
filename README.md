@@ -28,7 +28,7 @@ mlx-code [options] [-- claude options]
 | `--work` | `$CWD` | Working directory mirrored into the Claude session |
 | `--home` | temp dir | Home directory for the Claude process |
 
-Any extra arguments after `--` are forwarded to the `claude` CLI
+Any extra arguments after `--` are forwarded to the `claude` CLI.
 
 ### Licence
 

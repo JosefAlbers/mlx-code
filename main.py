@@ -1,3 +1,4 @@
+# {{{
 # Copyright 2026 J Joe
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,8 +26,22 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import mlx.core as mx
 import mlx_lm
-from mlx_lm.generate import generate_step
+import numpy as np
+import hashlib
+import contextlib
+import functools
+import mlx.nn as nn
+from typing import (
+    Any,
+    Callable,
+    Generator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
+generation_stream = mx.new_stream(mx.default_device())
 stream_logger = logging.getLogger("stream")
 stream_logger.setLevel(logging.DEBUG)
 s_handler = logging.FileHandler("mlx_stream.log", mode='w')
@@ -39,7 +54,54 @@ t_handler = logging.FileHandler("mlx_trace.log", mode='w')
 t_handler.setFormatter(logging.Formatter("【%(message)s\n】\n"))
 trace_logger.addHandler(t_handler)
 gen_lock = threading.Lock()
-prompt_cache = {}
+dict_cache = {}
+
+def hash_tokens(tokens):
+    arr = np.array(tokens, dtype=np.uint32)
+    return hashlib.blake2b(arr.tobytes(), digest_size=8).hexdigest()
+
+def get_common_len(a, b):
+    common_len = 0
+    for p, h in zip(a, b):
+        if p == h:
+            common_len += 1
+        else:
+            break
+    return common_len
+
+@contextlib.contextmanager
+def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
+    if not mx.metal.is_available():
+        try:
+            yield
+        finally:
+            pass
+    else:
+        model_bytes = tree_reduce(
+            lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
+        )
+        max_rec_size = mx.device_info()["max_recommended_working_set_size"]
+        if model_bytes > 0.9 * max_rec_size:
+            model_mb = model_bytes // 2**20
+            max_rec_mb = max_rec_size // 2**20
+            print(f"{model_mb=} {max_rec_mb=}")
+        old_limit = mx.set_wired_limit(max_rec_size)
+        try:
+            yield
+        finally:
+            if streams is not None:
+                for s in streams:
+                    mx.synchronize(s)
+            else:
+                mx.synchronize()
+            mx.set_wired_limit(old_limit)
+
+def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
+    if kv_bits is None:
+        return
+    for e, c in enumerate(prompt_cache):
+        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+            prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 def parse_tool(tools, names):
     qwen_tools = []
@@ -121,11 +183,17 @@ def encode(body, tokenizer, system, names, skips):
         if parts:
             msgs.append({"role": role}|parts)
     if not msgs[-1].get('content', '').strip():
-        return None
-    return tokenizer.apply_chat_template(msgs, tools = parse_tool(body.get("tools", []), names), tokenize=False, add_generation_prompt=True)
+        return None, -1
+    apply_chat_template = lambda x: tokenizer.apply_chat_template(x, tools = parse_tool(body.get("tools", []), names), tokenize=False, add_generation_prompt=True)
+    full = apply_chat_template(msgs)
+    last_user_idx = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=None)
+    if last_user_idx is None:
+        return full, -1
+    p_msgs = msgs[:last_user_idx] + [dict(role='user', content='h' if msgs[last_user_idx]['content'][0] != 'h' else 'i')]
+    pref = apply_chat_template(p_msgs)
+    return full, pref
 
 def decode(raw_text, tokenizer, parse_think, single_think=False):
-    # think_id = tokenizer.convert_tokens_to_ids("<think>")
     def escape(text):
         def repl(match):
             inner = match.group(1)
@@ -139,7 +207,6 @@ def decode(raw_text, tokenizer, parse_think, single_think=False):
         parts = re.split(r'(<think>.*?</think>)', raw_text, flags=re.DOTALL, maxsplit=1 if single_think else 0)
     else:
         parts = [raw_text]
-
     for part in parts:
         if not part:
             continue 
@@ -192,7 +259,7 @@ def blocks_to_sse(blocks: list[dict], msg_id: str, in_tokens: int, out_tokens: i
         elif bt == "tool_use":
             out += event("content_block_start", {"type": "content_block_start", "index": i,
                 "content_block": {"type": "tool_use", "id": block["id"],
-                    "name": block["name"], "input": {}}})
+                    "name": block["name"], "input": {}} })
             out += event("content_block_delta", {"type": "content_block_delta", "index": i,
                 "delta": {"type": "input_json_delta", "partial_json": json.dumps(block["input"])}})
         out += event("content_block_stop", {"type": "content_block_stop", "index": i})
@@ -203,6 +270,8 @@ def blocks_to_sse(blocks: list[dict], msg_id: str, in_tokens: int, out_tokens: i
     return bytes(out)
 
 def dmca(p_str):
+    if True: #: False for recording
+        return p_str
     symbols = ["▲", "△", "▶", "▷", "▼", "▽", "◀", "◁", "◆", "◇"]
     def mask_text(text):
         return re.sub(r"\S", lambda _: random.choice(symbols), text)
@@ -217,66 +286,6 @@ def dmca(p_str):
     for pattern in block_patterns:
         p_str = re.sub(pattern, lambda m: mask_text(m.group(0)), p_str)
     return p_str
-
-def generate(model, tokenizer, prompt, hook=None, max_tokens=256, helper_max_tokens=64, **kwargs):
-    global prompt_cache
-    if prompt is None:
-        return '', 0, 0
-    if not isinstance(tokenizer, mlx_lm.tokenizer_utils.TokenizerWrapper):
-        tokenizer = mlx_lm.tokenizer_utils.TokenizerWrapper(tokenizer)
-    detokenizer = tokenizer.detokenizer
-    if isinstance(prompt, str):
-        add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(tokenizer.bos_token)
-        prompt_s = prompt
-        prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-    else:
-        prompt_s = tokenizer.decode(prompt)
-    stream_logger.debug(dmca(prompt_s))
-    common_len = 0
-    if prompt_cache.get('cache', None):
-        for p, h in zip(prompt, prompt_cache['hx']):
-            if p == h:
-                common_len += 1
-            else:
-                break
-        common_len = min(common_len, len(prompt) - 1)
-    else:
-        prompt_cache['hx'] = []
-        prompt_cache['cache'] = mlx_lm.models.cache.make_prompt_cache(model)
-    hx_len = len(prompt_cache['hx']) 
-    trim_len = hx_len - common_len
-    mlx_lm.models.cache.trim_prompt_cache(prompt_cache['cache'], trim_len)
-    token_gen = generate_step(
-        mx.array(prompt[common_len:]),
-        model,
-        prompt_cache=prompt_cache['cache'],
-        max_tokens=max_tokens,
-        **kwargs,
-    )
-    text = ""
-    tic_non = time.perf_counter()
-    gens = []
-    for token, _ in token_gen:
-        gens.append(token)
-        if token in tokenizer.eos_token_ids:
-            break
-        detokenizer.add_token(token)
-        seg = detokenizer.last_segment
-        stream_logger.debug(seg)
-        text += seg
-        if len(gens) == 1:
-            tic_inp = time.perf_counter()
-            if prompt_cache.get('file_name'): 
-                _fn = prompt_cache.pop('file_name')
-                mlx_lm.models.cache.save_prompt_cache(_fn, prompt_cache['cache'], metadata=dict(model_name=prompt_cache['model_name'], hx=json.dumps(prompt+gens)))
-        if len(gens) >= max_tokens:
-            break
-    tic_out = time.perf_counter()
-    detokenizer.finalize()
-    text += detokenizer.last_segment
-    prompt_cache['hx'] = prompt+gens
-    trace_logger.debug(f'G {hx_len} {len(prompt)} {common_len} {trim_len} {len(gens)}\n=== TPS ===\n- Processed {len(prompt)} input tokens in {tic_inp-tic_non:.0f} seconds ({len(prompt)/(tic_inp-tic_non):.0f} tokens per second)\n- Generated {len(gens)} new tokens in {tic_out-tic_inp:.0f} seconds ({len(gens)/(tic_out-tic_inp):.0f} tokens per second)\n\n=== INP ===\n{dmca(prompt_s)}\n=== OUT ===\n{text}')
-    return text, len(prompt), len(gens)
 
 def make_handler(model, tokenizer, system, names, skips, parse_think=True):
     class Handler(BaseHTTPRequestHandler):
@@ -308,9 +317,9 @@ def make_handler(model, tokenizer, system, names, skips, parse_think=True):
                 return
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n))
-            prompt = encode(body, tokenizer, system, names, skips)
+            prompt, pref = encode(body, tokenizer, system, names, skips)
             with gen_lock:
-                raw, in_tokens, out_tokens = generate(model, tokenizer, prompt=prompt, max_tokens=body.get("max_tokens", 8192))
+                raw, in_tokens, out_tokens = generate(model, tokenizer, pref=pref, prompt=prompt, max_tokens=body.get("max_tokens", 8192))
             blocks, stop_reason = decode(raw, tokenizer, parse_think=parse_think)
             msg_id = f"msg_{uuid.uuid4().hex}"
             sse = blocks_to_sse(blocks, msg_id, in_tokens, out_tokens, stop_reason)
@@ -326,6 +335,18 @@ def make_handler(model, tokenizer, system, names, skips, parse_think=True):
                 pass
     return Handler
 
+def load_dict_cache(cache_path):
+    global dict_cache
+    cache, metadata = mlx_lm.models.cache.load_prompt_cache(cache_path, return_metadata=True)
+    mx.eval(cache)
+    model_name = metadata.pop("model_name", "")
+    tokens_str = metadata.pop("hx", "[]")
+    tokens = json.loads(tokens_str)
+    dict_cache = dict(cache=cache, hx=tokens, model_name=model_name)
+
+def save_dict_cache(cache_path, metadata, prompt_cache):
+    mlx_lm.models.cache.save_prompt_cache(cache_path, prompt_cache, metadata=metadata)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="mlx-community/Qwen3.5-4B-OptiQ-4bit")
@@ -334,7 +355,8 @@ def main():
     parser.add_argument("--system", type=str, default='')
     # parser.add_argument("--system", type=str, default='# Env\n{env}')
     # parser.add_argument("--system", type=str, default=None)
-    parser.add_argument("--cache", type=str, default='cache/cache.safetensors')
+    # parser.add_argument("--cache", type=str, default='cache/cache.safetensors')
+    parser.add_argument("--cache", type=str, default='cache')
     # parser.add_argument("--names", nargs="+", default=[])
     parser.add_argument("--names", nargs="+", default=['Read','Edit','Write','Grep','Glob','Bash','Agent','Skill'])
     # parser.add_argument("--names", nargs="+", default=None)
@@ -347,20 +369,9 @@ def main():
     parser.add_argument("--home", default=tempfile.mkdtemp())
     parser.add_argument("--work", default=os.getcwd())
     args, claude_args = parser.parse_known_args()
-    global prompt_cache
-    if os.path.exists(args.cache):
-        cache, metadata = mlx_lm.models.cache.load_prompt_cache(args.cache, return_metadata=True)
-        mx.eval(cache)
-        model_name = metadata.pop("model_name", "")
-        tokens_str = metadata.pop("hx", "[]")
-        tokens = json.loads(tokens_str)
-        prompt_cache = dict(cache=cache, hx=tokens, model_name=model_name)
-        if prompt_cache.get('model_name') != args.model:
-            prompt_cache = dict(model_name=args.model)
-    else:
-        Path(args.cache).parent.mkdir(parents=True, exist_ok=True)
-        prompt_cache = dict(model_name=args.model)
-    prompt_cache['file_name']=args.cache
+    Path(args.cache).mkdir(parents=True, exist_ok=True)
+    global dict_cache
+    dict_cache = dict(model_name=args.model, cache_dir = args.cache)
     model, tokenizer = mlx_lm.load(args.model)
     server = HTTPServer((args.host, args.port), make_handler(model, tokenizer, args.system, args.names, args.skips))
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -379,6 +390,229 @@ def main():
     workspace = os.path.join(args.home, "workspace")
     mirror_workspace(args.work, workspace)
     sys.exit(subprocess.run(["claude"] + claude_args, env=env, cwd=workspace).returncode)
+
+def generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    max_kv_size: Optional[int] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    input_embeddings: Optional[mx.array] = None,
+    save_at: int = -1,
+    save_fn = None,
+) -> Generator[Tuple[mx.array, mx.array], None, None]:
+    if input_embeddings is not None:
+        if not does_model_support_input_embeddings(model):
+            raise ValueError("Model does not support input embeddings.")
+        elif len(prompt) > 0 and len(prompt) != len(input_embeddings):
+            raise ValueError(f"{len(input_embeddings)=} {len(prompt)=}")
+    elif len(prompt) == 0:
+        raise ValueError("Either input_embeddings or prompt (or both) must be provided.")
+
+    tokens = None
+
+    if prompt_cache is None:
+        prompt_cache = cache.make_prompt_cache(
+            model,
+            max_kv_size=max_kv_size,
+        )
+
+    prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
+        if input_embeddings is not None:
+            return model(
+                input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
+            )
+        else:
+            return model(input_tokens, cache=prompt_cache)
+
+    def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
+        nonlocal tokens
+
+        with mx.stream(generation_stream):
+            logits = _model_call(
+                input_tokens=input_tokens[None],
+                input_embeddings=(
+                    input_embeddings[None] if input_embeddings is not None else None
+                ),
+            )
+
+            logits = logits[:, -1, :]
+
+            if logits_processors and len(input_tokens) > 0:
+                tokens = (
+                    mx.concat([tokens, input_tokens])
+                    if tokens is not None
+                    else input_tokens
+                )
+                for processor in logits_processors:
+                    logits = processor(tokens, logits)
+
+            quantize_cache_fn(prompt_cache)
+            logprobs = logits - mx.logsumexp(logits, keepdims=True)
+            sampled = sampler(logprobs)
+            return sampled, logprobs.squeeze(0)
+
+    with mx.stream(generation_stream):
+        total_prompt_tokens = (
+            len(input_embeddings) if input_embeddings is not None else len(prompt)
+        )
+        prompt_processed_tokens = 0
+        prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+        while total_prompt_tokens - prompt_processed_tokens > 1:
+            remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
+            n_to_process = min(prefill_step_size, remaining)
+            if prompt_processed_tokens < save_at:
+                n_to_process = min(n_to_process, save_at - prompt_processed_tokens)
+
+            _model_call(
+                input_tokens=prompt[:n_to_process][None],
+                input_embeddings=(
+                    input_embeddings[:n_to_process][None]
+                    if input_embeddings is not None
+                    else None
+                ),
+            )
+            quantize_cache_fn(prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
+            prompt_processed_tokens += n_to_process
+            prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+            prompt = prompt[n_to_process:]
+            input_embeddings = (
+                input_embeddings[n_to_process:]
+                if input_embeddings is not None
+                else input_embeddings
+            )
+            mx.clear_cache()
+            if save_fn is not None and prompt_processed_tokens == save_at:
+                save_fn(prompt_cache)
+
+        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+
+    mx.async_eval(y, logprobs)
+    n = 0
+    while True:
+        if n != max_tokens:
+            next_y, next_logprobs = _step(y)
+            mx.async_eval(next_y, next_logprobs)
+        if n == 0:
+            mx.eval(y)
+            prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+        if n == max_tokens:
+            break
+        yield y.item(), logprobs
+        if n % 256 == 0:
+            mx.clear_cache()
+        y, logprobs = next_y, next_logprobs
+        n += 1
+
+def generate(model, tokenizer, prompt, pref, hook=None, max_tokens=256, helper_max_tokens=64, **kwargs):
+    global dict_cache
+    if prompt is None:
+        return '', 0, 0
+    if not isinstance(tokenizer, mlx_lm.tokenizer_utils.TokenizerWrapper):
+        tokenizer = mlx_lm.tokenizer_utils.TokenizerWrapper(tokenizer)
+    detokenizer = tokenizer.detokenizer
+    if isinstance(prompt, str):
+        add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(tokenizer.bos_token)
+        prompt_s = prompt
+        prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+        _pref = tokenizer.encode(pref, add_special_tokens=add_special_tokens)
+        save_at = get_common_len(prompt, _pref)
+    else:
+        prompt_s = tokenizer.decode(prompt)
+        save_at = -1 # □ for now
+    stream_logger.debug(dmca(prompt_s))
+    text = ''
+    gens = []
+    common_len = 0
+    hx_len = None
+    trim_len = None
+    save_fn = None
+    if not dict_cache.get('cache'):
+        ckpt_path = Path(dict_cache['cache_dir'])/f'{"".join(c for c in dict_cache["model_name"] if c.isalnum())}_{save_at}_{hash_tokens(prompt[:save_at])}.safetensors'
+        trace_logger.debug(ckpt_path.resolve())
+        trace_logger.debug(ckpt_path.absolute())
+        if os.path.exists(ckpt_path):
+            load_dict_cache(ckpt_path)
+        else:
+            dict_cache |= dict(cache=mlx_lm.models.cache.make_prompt_cache(model), hx=[])
+            save_fn = functools.partial(save_dict_cache, ckpt_path, dict(model_name=dict_cache['model_name'], hx=json.dumps(prompt[:save_at+1])))
+
+    if (hx := dict_cache.get('hx')):
+        _hx = hx[:-1]
+        common_len = get_common_len(prompt, _hx)
+        hx_len = len(_hx)
+        trim_len = hx_len - common_len
+        if trim_len > 0:
+            if all(c.is_trimmable() for c in dict_cache['cache']):
+                mlx_lm.models.cache.trim_prompt_cache(dict_cache['cache'], trim_len)
+            else:
+                ckpt_path = Path(dict_cache['cache_dir'])/f'{"".join(c for c in dict_cache["model_name"] if c.isalnum())}_{save_at}_{hash_tokens(prompt[:save_at])}.safetensors'
+                if os.path.exists(ckpt_path):
+                    load_dict_cache(ckpt_path)
+                    common_len = save_at
+    if save_at > common_len and not all(c.is_trimmable() for c in dict_cache['cache']):
+        ckpt_path = Path(dict_cache['cache_dir'])/f'{"".join(c for c in dict_cache["model_name"] if c.isalnum())}_{save_at}_{hash_tokens(prompt[:save_at])}.safetensors'
+        save_fn = functools.partial(save_dict_cache, ckpt_path, dict(model_name=dict_cache['model_name'], hx=json.dumps(prompt[:save_at+1])))
+    else:
+        save_at = -1
+
+    if common_len==len(prompt):
+        _last_gen = dict_cache['hx'][common_len]
+        prompt_arr = mx.array([_last_gen])
+        gens.append(_last_gen)
+        detokenizer.add(_last_gen)
+    else:
+        prompt_arr = mx.array(prompt[common_len:])
+
+    trace_logger.debug(f'{save_at=} {common_len=}')
+    token_gen = generate_step(
+        prompt_arr,
+        model,
+        prompt_cache=dict_cache['cache'],
+        max_tokens=max_tokens,
+        save_at=save_at-common_len,
+        save_fn=save_fn,
+        **kwargs,
+    )
+    tic_non = time.perf_counter()
+    for token, _ in token_gen:
+        gens.append(token)
+        if token in tokenizer.eos_token_ids:
+            break
+        detokenizer.add_token(token)
+        seg = detokenizer.last_segment
+        stream_logger.debug(seg)
+        text += seg
+        if len(gens) == 1:
+            tic_inp = time.perf_counter()
+        if len(gens) >= max_tokens:
+            break
+    tic_out = time.perf_counter()
+    detokenizer.finalize()
+    text += detokenizer.last_segment
+    dict_cache['hx'] = prompt+gens
+    trace_logger.debug(f'G {hx_len} {len(prompt)} {common_len} {trim_len} {len(gens)}\n=== TPS ===\n- Processed {len(prompt)} input tokens in {tic_inp-tic_non:.0f} seconds ({len(prompt)/(tic_inp-tic_non):.0f} tokens per second)\n- Generated {len(gens)} new tokens in {tic_out-tic_inp:.0f} seconds ({len(gens)/(tic_out-tic_inp):.0f} tokens per second)\n\n=== INP ===\n{dmca(prompt_s)}\n=== OUT ===\n{text}')
+    return text, len(prompt), len(gens)
 
 if __name__ == "__main__":
     main()
