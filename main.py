@@ -1,4 +1,3 @@
-# {{{
 # Copyright 2026 J Joe
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -183,12 +182,12 @@ def encode(body, tokenizer, system, names, skips):
         if parts:
             msgs.append({"role": role}|parts)
     if not msgs[-1].get('content', '').strip():
-        return None, -1
+        return None, ''
     apply_chat_template = lambda x: tokenizer.apply_chat_template(x, tools = parse_tool(body.get("tools", []), names), tokenize=False, add_generation_prompt=True)
     full = apply_chat_template(msgs)
     last_user_idx = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=None)
     if last_user_idx is None:
-        return full, -1
+        return full, ''
     p_msgs = msgs[:last_user_idx] + [dict(role='user', content='h' if msgs[last_user_idx]['content'][0] != 'h' else 'i')]
     pref = apply_chat_template(p_msgs)
     return full, pref
@@ -323,6 +322,7 @@ def make_handler(model, tokenizer, system, names, skips, parse_think=True):
             blocks, stop_reason = decode(raw, tokenizer, parse_think=parse_think)
             msg_id = f"msg_{uuid.uuid4().hex}"
             sse = blocks_to_sse(blocks, msg_id, in_tokens, out_tokens, stop_reason)
+            trace_logger.debug(sse)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -336,26 +336,27 @@ def make_handler(model, tokenizer, system, names, skips, parse_think=True):
     return Handler
 
 def load_dict_cache(cache_path):
-    global dict_cache
     cache, metadata = mlx_lm.models.cache.load_prompt_cache(cache_path, return_metadata=True)
     mx.eval(cache)
     model_name = metadata.pop("model_name", "")
     tokens_str = metadata.pop("hx", "[]")
     tokens = json.loads(tokens_str)
-    dict_cache = dict(cache=cache, hx=tokens, model_name=model_name)
+    global dict_cache
+    dict_cache |= dict(cache=cache, hx=tokens, model_name=model_name)
 
 def save_dict_cache(cache_path, metadata, prompt_cache):
     mlx_lm.models.cache.save_prompt_cache(cache_path, prompt_cache, metadata=metadata)
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--harness", default=None)
+    # parser.add_argument("--harness", default="claude")
     parser.add_argument("--model", default="mlx-community/Qwen3.5-4B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-2B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-0.8B-MLX-bf16")
     parser.add_argument("--system", type=str, default='')
     # parser.add_argument("--system", type=str, default='# Env\n{env}')
     # parser.add_argument("--system", type=str, default=None)
-    # parser.add_argument("--cache", type=str, default='cache/cache.safetensors')
     parser.add_argument("--cache", type=str, default='cache')
     # parser.add_argument("--names", nargs="+", default=[])
     parser.add_argument("--names", nargs="+", default=['Read','Edit','Write','Grep','Glob','Bash','Agent','Skill'])
@@ -368,28 +369,40 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--home", default=tempfile.mkdtemp())
     parser.add_argument("--work", default=os.getcwd())
-    args, claude_args = parser.parse_known_args()
+    parser.add_argument("--nocc", action="store_true", help="Disable Claude Code subprocess and run server only")
+    args, harness_args = parser.parse_known_args()
     Path(args.cache).mkdir(parents=True, exist_ok=True)
     global dict_cache
     dict_cache = dict(model_name=args.model, cache_dir = args.cache)
     model, tokenizer = mlx_lm.load(args.model)
     server = HTTPServer((args.host, args.port), make_handler(model, tokenizer, args.system, args.names, args.skips))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    env = os.environ.copy()
-    env["ANTHROPIC_BASE_URL"] = f"http://{args.host}:{args.port}"
-    env["ANTHROPIC_AUTH_TOKEN"] = "local"
-    env["ANTHROPIC_MODEL"] = args.model
-    env["ANTHROPIC_SMALL_FAST_MODEL"] = args.model
-    env["HOME"] = args.home 
-    def mirror_workspace(src: str, dst: str):
-        for root, dirs, files in os.walk(src):
-            rel = os.path.relpath(root, src)
-            os.makedirs(os.path.join(dst, rel), exist_ok=True)
-            for f in files:
-                os.link(os.path.join(root, f), os.path.join(dst, rel, f))
-    workspace = os.path.join(args.home, "workspace")
-    mirror_workspace(args.work, workspace)
-    sys.exit(subprocess.run(["claude"] + claude_args, env=env, cwd=workspace).returncode)
+    if args.nocc:
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down server...")
+            server.server_close()
+    else:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        env = os.environ.copy()
+        env["ANTHROPIC_BASE_URL"] = f"http://{args.host}:{args.port}"
+        env["ANTHROPIC_AUTH_TOKEN"] = "local"
+        env["ANTHROPIC_MODEL"] = args.model
+        env["ANTHROPIC_SMALL_FAST_MODEL"] = args.model
+        env["HOME"] = args.home 
+        def mirror_workspace(src: str, dst: str):
+            for root, dirs, files in os.walk(src):
+                rel = os.path.relpath(root, src)
+                os.makedirs(os.path.join(dst, rel), exist_ok=True)
+                for f in files:
+                    os.link(os.path.join(root, f), os.path.join(dst, rel, f))
+        workspace = os.path.join(args.home, "workspace")
+        mirror_workspace(args.work, workspace)
+        if args.harness is None:
+            from pie import run_repl
+            run_repl(base_url=f"http://{args.host}:{args.port}/v1")
+        else:
+            sys.exit(subprocess.run([args.harness] + harness_args, env=env, cwd=workspace).returncode)
 
 def generate_step(
     prompt: mx.array,
@@ -549,8 +562,6 @@ def generate(model, tokenizer, prompt, pref, hook=None, max_tokens=256, helper_m
     save_fn = None
     if not dict_cache.get('cache'):
         ckpt_path = Path(dict_cache['cache_dir'])/f'{"".join(c for c in dict_cache["model_name"] if c.isalnum())}_{save_at}_{hash_tokens(prompt[:save_at])}.safetensors'
-        trace_logger.debug(ckpt_path.resolve())
-        trace_logger.debug(ckpt_path.absolute())
         if os.path.exists(ckpt_path):
             load_dict_cache(ckpt_path)
         else:
@@ -570,6 +581,11 @@ def generate(model, tokenizer, prompt, pref, hook=None, max_tokens=256, helper_m
                 if os.path.exists(ckpt_path):
                     load_dict_cache(ckpt_path)
                     common_len = save_at
+                else:
+                    dict_cache |= dict(cache=mlx_lm.models.cache.make_prompt_cache(model), hx=[])
+                    save_fn = functools.partial(save_dict_cache, ckpt_path, dict(model_name=dict_cache['model_name'], hx=json.dumps(prompt[:save_at+1])))
+                    common_len = 0
+
     if save_at > common_len and not all(c.is_trimmable() for c in dict_cache['cache']):
         ckpt_path = Path(dict_cache['cache_dir'])/f'{"".join(c for c in dict_cache["model_name"] if c.isalnum())}_{save_at}_{hash_tokens(prompt[:save_at])}.safetensors'
         save_fn = functools.partial(save_dict_cache, ckpt_path, dict(model_name=dict_cache['model_name'], hx=json.dumps(prompt[:save_at+1])))
@@ -584,7 +600,6 @@ def generate(model, tokenizer, prompt, pref, hook=None, max_tokens=256, helper_m
     else:
         prompt_arr = mx.array(prompt[common_len:])
 
-    trace_logger.debug(f'{save_at=} {common_len=}')
     token_gen = generate_step(
         prompt_arr,
         model,

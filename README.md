@@ -30,8 +30,10 @@ mlx-code [options] [-- claude options]
 
 Any extra arguments after `--` are forwarded to the `claude` CLI.
 
+### Credits
+
+`pie.py` is based on [pi](https://github.com/badlogic/pi-mono) by Mario Zechner, used under the MIT License.
+
 ### Licence
 
 Apache License 2.0 — see LICENSE for details.
-
-
