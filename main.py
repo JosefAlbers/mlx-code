@@ -349,8 +349,8 @@ def save_dict_cache(cache_path, metadata, prompt_cache):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--harness", default=None)
-    # parser.add_argument("--harness", default="claude")
+    # parser.add_argument("--harness", default=None)
+    parser.add_argument("--harness", default="claude")
     parser.add_argument("--model", default="mlx-community/Qwen3.5-4B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-2B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-0.8B-MLX-bf16")
