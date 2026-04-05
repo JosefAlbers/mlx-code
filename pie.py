@@ -14,207 +14,120 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
+import os
+import pathlib
+import re
+import subprocess
 import sys
 import time
 import uuid
+from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
-from typing import (
-    Any,
-    AsyncIterable,
-    AsyncIterator,
-    Awaitable,
-    Callable,
-    Literal,
-    Protocol,
-    TypeAlias,
-    TypedDict,
-    Union,
-    TypeVar,
-    Generic,
-    cast
-)
+from typing import Any, Awaitable, Callable, Literal, TypeAlias, Union
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
-StopReason = Literal["stop", "length", "toolUse", "error", "aborted"]
-Role = Literal["system", "user", "assistant", "toolResult"]
-
-@dataclass(slots=True)
-class Usage:
-    input: int = 0
-    output: int = 0
-    cache_read: int = 0
-    cache_write: int = 0
-    total_tokens: int = 0
-    cost: dict[str, float] = field(default_factory=lambda: {"total": 0.0})
-
-
-@dataclass(slots=True)
+@dataclass
 class TextContent:
     text: str
     type: Literal["text"] = "text"
+    cache_control: str | None = None   
 
 
-@dataclass(slots=True)
+@dataclass
 class ThinkingContent:
     thinking: str
     type: Literal["thinking"] = "thinking"
+    signature: str | None = None       
     redacted: bool = False
-    signature: str | None = None
 
 
-@dataclass(slots=True)
+@dataclass
 class ImageContent:
-    data: str  
+    data: str                          
     mime_type: str
     type: Literal["image"] = "image"
+    cache_control: str | None = None
 
 
-@dataclass(slots=True)
+@dataclass
 class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
     type: Literal["toolCall"] = "toolCall"
 
-
-AssistantContent = Union[TextContent, ThinkingContent, ToolCall]
-
-
-@dataclass(slots=True)
+@dataclass
 class UserMessage:
-    content: str | list[Union[TextContent, ImageContent]]
-    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
+    content: str | list[TextContent | ImageContent]
     role: Literal["user"] = "user"
-
-
-@dataclass(slots=True)
-class AssistantMessage:
-    api: str
-    provider: str
-    model: str
-    content: list[AssistantContent] = field(default_factory=list)
-    usage: Usage = field(default_factory=Usage)
-    stop_reason: StopReason = "stop"
-    error_message: str | None = None
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
+
+
+@dataclass
+class AssistantMessage:
+    content: list[TextContent | ThinkingContent | ToolCall] = field(default_factory=list)
+    stop_reason: "StopReason" = "stop"
+    usage: "Usage" = field(default_factory=lambda: Usage())
+    error_message: str | None = None
     role: Literal["assistant"] = "assistant"
-    response_id: str | None = None
+    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
-@dataclass(slots=True)
+@dataclass
 class ToolResultMessage:
     tool_call_id: str
     tool_name: str
-    content: list[Union[TextContent, ImageContent]]
+    content: list[TextContent | ImageContent]
     is_error: bool = False
-    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
     role: Literal["toolResult"] = "toolResult"
-    details: Any = None
+    timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
 
 
-Message = Union[UserMessage, AssistantMessage, ToolResultMessage]
-
-TParams = TypeVar("TParams", bound=BaseModel)
-TDetails = TypeVar("TDetails")
-
-@dataclass(slots=True)
-class AgentToolResult(Generic[TDetails]):
-    content: list[Union[TextContent, ImageContent]]
-    details: TDetails
-
-AgentToolUpdateCallback = Callable[[AgentToolResult[Any]], Awaitable[None]]
-
-from abc import ABC, abstractmethod
-
-class AgentTool(ABC, Generic[TParams, TDetails]):
-    name: str
-    description: str
-    parameters: type[TParams]
-    label: str | None = None
-
-    @abstractmethod
-    async def execute(
-        self,
-        tool_call_id: str,
-        params: TParams,
-        signal: asyncio.Event | None = None,
-        on_update: AgentToolUpdateCallback | None = None,
-    ) -> AgentToolResult[TDetails]: ...
-
-    def prepare_arguments(self, args: Any) -> dict[str, Any]:
-        """Optional hook to shim/fix raw tool-call arguments before validation."""
-        return cast(dict[str, Any], args)
-
-def validate_tool_arguments(tool: AgentTool[TParams, TDetails], tool_call: ToolCall) -> TParams:
-    """Validates tool call arguments against the tool's Pydantic model."""
-    try:
-        prepared_args = tool.prepare_arguments(tool_call.arguments)
-        return tool.parameters.model_validate(prepared_args)
-    except ValidationError as e:
-        error_details = "\n".join(f"  - {'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors())
-        error_msg = (
-            f"Validation failed for tool '{tool_call.name}':\n{error_details}\n\n"
-            f"Received arguments:\n{json.dumps(tool_call.arguments, indent=2)}"
-        )
-        raise ValueError(error_msg)
-
-@dataclass(slots=True)
-class Model:
-    id: str
-    provider: str
-    api: str
-    name: str = ""
-    baseUrl: str = ""
-    reasoning: bool = False
-    contextWindow: int = 4096
-    maxTokens: int = 1024
+Message: TypeAlias = Union[UserMessage, AssistantMessage, ToolResultMessage]
+StopReason: TypeAlias = Literal["stop", "length", "tool_use", "error", "aborted"]
 
 
-@dataclass(slots=True)
-class ProviderOptions:
-    api_key: str | None = None
-    base_url: str | None = None
-    headers: dict[str, str] = field(default_factory=dict)
-    timeout_seconds: float = 60.0
-    temperature: float | None = None
-    max_tokens: int | None = None
-    reasoning: Literal["off", "minimal", "low", "medium", "high", "xhigh"] = "off"
+@dataclass
+class Usage:
+    input: int = 0
+    output: int = 0
+    cache_read: int = 0
+    cache_write: int = 0
 
-
-EventType = Literal[
+EventType: TypeAlias = Literal[
     "start",
-    "text_start",
     "text_delta",
-    "text_end",
-    "thinking_start",
     "thinking_delta",
-    "thinking_end",
-    "toolcall_start",
-    "toolcall_delta",
     "toolcall_end",
     "done",
     "error",
 ]
 
 
-@dataclass(slots=True)
+@dataclass
 class Event:
     type: EventType
     payload: dict[str, Any] = field(default_factory=dict)
 
 
-class AssistantEventStream:
+class EventStream:
     def __init__(self) -> None:
         self._queue: asyncio.Queue[Event | None] = asyncio.Queue()
         self._result: AssistantMessage | None = None
+        self._task: asyncio.Task | None = None
+
+    def _attach(self, task: asyncio.Task) -> None:
+        self._task = task
 
     def push(self, event: Event) -> None:
         self._queue.put_nowait(event)
 
-    def end(self, result: AssistantMessage) -> None:
+    def finish(self, result: AssistantMessage) -> None:
         self._result = result
         self._queue.put_nowait(None)
 
@@ -225,7 +138,7 @@ class AssistantEventStream:
         assert self._result is not None
         return self._result
 
-    def __aiter__(self) -> "AssistantEventStream":
+    def __aiter__(self) -> "EventStream":
         return self
 
     async def __anext__(self) -> Event:
@@ -234,925 +147,922 @@ class AssistantEventStream:
             raise StopAsyncIteration
         return item
 
-
-class Provider(Protocol):
-    async def stream(
-        self, model: Model, context: Context, options: ProviderOptions | None = None
-    ) -> AssistantEventStream: ...
-
-
-@dataclass(slots=True)
-class Context:
-    model_id: str
-    provider: str
-    api: str
-    messages: list[Message] = field(default_factory=list)
-    system_prompt: str = ""
-    tools: list[AgentTool] = field(default_factory=list)
+@dataclass
+class ToolResult:
+    content: list[TextContent | ImageContent]
+    is_error: bool = False
 
 
-@dataclass(slots=True)
-class BeforeToolCallContext:
-    assistant_message: AssistantMessage
-    tool_call: ToolCall
-    args: Any
-    context: Context
+class Tool(ABC):
+    name: str
+    description: str
+    parameters: type[BaseModel]
 
-@dataclass(slots=True)
-class BeforeToolCallResult:
-    block: bool = False
-    reason: str | None = None
+    @abstractmethod
+    async def execute(
+        self,
+        params: BaseModel,
+        signal: asyncio.Event | None = None,
+    ) -> ToolResult: ...
 
-@dataclass(slots=True)
-class AfterToolCallContext:
-    assistant_message: AssistantMessage
-    tool_call: ToolCall
-    args: Any
-    result: AgentToolResult[Any]
-    is_error: bool
-    context: Context
-
-@dataclass(slots=True)
-class AfterToolCallResult:
-    content: list[Union[TextContent, ImageContent]] | None = None
-    details: Any = None
-    is_error: bool | None = None
-
-@dataclass(slots=True)
-class AgentConfig:
-    tool_execution: Literal["sequential", "parallel"] = "parallel"
-    convert_to_llm: Callable[[list[Message]], Awaitable[list[Message]]] | None = None
-    transform_context: Callable[[list[Message]], Awaitable[list[Message]]] | None = None
-    before_tool_call: (
-        Callable[[BeforeToolCallContext, asyncio.Event | None], Awaitable[BeforeToolCallResult | None]] | None
-    ) = None
-    after_tool_call: (
-        Callable[[AfterToolCallContext, asyncio.Event | None], Awaitable[AfterToolCallResult | None]] | None
-    ) = None
-    get_steering_messages: Callable[[], Awaitable[list[Message]]] | None = None
-    get_follow_up_messages: Callable[[], Awaitable[list[Message]]] | None = None
-
-@dataclass(slots=True)
-class AgentEvent:
-    type: str
-    payload: dict[str, Any] = field(default_factory=dict)
-
-AgentEventSink = Callable[[AgentEvent], Awaitable[None]]
-
-async def default_convert(messages: list[Message]) -> list[Message]:
-    return [
-        m for m in messages if getattr(m, "role", None) in {"user", "assistant", "toolResult"}
-    ]
-
-async def run_agent_loop(
-    context: Context,
-    emit: AgentEventSink,
-    registry: ProviderRegistry,
-    tools: list[AgentTool] | None = None,
-    config: AgentConfig | None = None,
-    provider_options: ProviderOptions | None = None,
-    signal: asyncio.Event | None = None,
-) -> list[Message]:
-    cfg = config or AgentConfig()
-    new_messages: list[Message] = []
-    current_context = context
-    if tools:
-        current_context.tools = tools
-
-    await emit(AgentEvent(type="agent_start"))
-
-    model = Model(id=context.model_id, provider=context.provider, api=context.api)
-
-    pending_steering = (
-        await cfg.get_steering_messages() if cfg.get_steering_messages else []
-    )
-
-    while True:
-        has_more_tool_calls = True
-
-        while has_more_tool_calls or pending_steering:
-            await emit(AgentEvent(type="turn_start"))
-            first_turn = False
-
-            if pending_steering:
-                for msg in pending_steering:
-                    await emit(AgentEvent(type="message_start", payload={"message": msg}))
-                    current_context.messages.append(msg)
-                    new_messages.append(msg)
-                    await emit(AgentEvent(type="message_end", payload={"message": msg}))
-                pending_steering = []
-
-            transformed = (
-                await cfg.transform_context(current_context.messages)
-                if cfg.transform_context
-                else current_context.messages
-            )
-            llm_messages = (
-                await cfg.convert_to_llm(transformed)
-                if cfg.convert_to_llm
-                else await default_convert(transformed)
-            )
-
-            llm_context = Context(
-                model_id=context.model_id,
-                provider=context.provider,
-                api=context.api,
-                system_prompt=context.system_prompt,
-                messages=llm_messages,
-                tools=context.tools,
-            )
-            
-            stream = await registry.stream(model, llm_context, provider_options)
-
-            assistant: AssistantMessage | None = None
-            added_partial = False
-            
-            async for event in stream:
-                if event.type == "start":
-                    assistant = event.payload["partial"]
-                    current_context.messages.append(assistant)
-                    added_partial = True
-                    await emit(AgentEvent(type="message_start", payload={"message": assistant}))
-                elif event.type in {"text_delta", "thinking_delta", "toolcall_delta", "toolcall_start", "toolcall_end"}:
-                    if assistant:
-                        assistant = event.payload["partial"]
-                        current_context.messages[-1] = assistant
-                        await emit(
-                            AgentEvent(
-                                type="message_update",
-                                payload={"message": assistant, "assistant_message_event": event},
-                            )
-                        )
-                elif event.type == "error":
-                    await emit(AgentEvent(type="error", payload=event.payload))
-
-            final_assistant = await stream.result()
-            if added_partial:
-                current_context.messages[-1] = final_assistant
-            else:
-                current_context.messages.append(final_assistant)
-                await emit(AgentEvent(type="message_start", payload={"message": final_assistant}))
-            
-            new_messages.append(final_assistant)
-            await emit(AgentEvent(type="message_end", payload={"message": final_assistant}))
-
-            if final_assistant.stop_reason in {"error", "aborted"}:
-                await emit(AgentEvent(type="turn_end", payload={"message": final_assistant, "tool_results": []}))
-                await emit(AgentEvent(type="agent_end", payload={"messages": new_messages}))
-                return new_messages
-
-            tool_calls = [c for c in final_assistant.content if isinstance(c, ToolCall)]
-            has_more_tool_calls = len(tool_calls) > 0
-            
-            tool_results: list[ToolResultMessage] = []
-            if has_more_tool_calls:
-                tool_results = await execute_tool_calls(current_context, final_assistant, tool_calls, cfg, signal, emit)
-                for res in tool_results:
-                    current_context.messages.append(res)
-                    new_messages.append(res)
-
-            await emit(AgentEvent(type="turn_end", payload={"message": final_assistant, "tool_results": tool_results}))
-            pending_steering = (await cfg.get_steering_messages()) if cfg.get_steering_messages else []
-
-        follow_ups = (await cfg.get_follow_up_messages()) if cfg.get_follow_up_messages else []
-        if not follow_ups:
-            break
-        pending_steering = follow_ups
-
-    await emit(AgentEvent(type="agent_end", payload={"messages": new_messages}))
-    return new_messages
-
-async def execute_tool_calls(
-    context: Context,
-    assistant_message: AssistantMessage,
-    tool_calls: list[ToolCall],
-    config: AgentConfig,
-    signal: asyncio.Event | None,
-    emit: AgentEventSink,
-) -> list[ToolResultMessage]:
-    if config.tool_execution == "sequential":
-        return await execute_tool_calls_sequential(context, assistant_message, tool_calls, config, signal, emit)
-    return await execute_tool_calls_parallel(context, assistant_message, tool_calls, config, signal, emit)
-
-async def execute_tool_calls_sequential(
-    context: Context,
-    assistant_message: AssistantMessage,
-    tool_calls: list[ToolCall],
-    config: AgentConfig,
-    signal: asyncio.Event | None,
-    emit: AgentEventSink,
-) -> list[ToolResultMessage]:
-    results = []
-    for call in tool_calls:
-        results.append(await handle_single_tool_call(context, assistant_message, call, config, signal, emit))
-    return results
-
-async def execute_tool_calls_parallel(
-    context: Context,
-    assistant_message: AssistantMessage,
-    tool_calls: list[ToolCall],
-    config: AgentConfig,
-    signal: asyncio.Event | None,
-    emit: AgentEventSink,
-) -> list[ToolResultMessage]:
-    tasks = []
-    for call in tool_calls:
-        tasks.append(handle_single_tool_call(context, assistant_message, call, config, signal, emit))
-    return list(await asyncio.gather(*tasks))
-
-async def handle_single_tool_call(
-    context: Context,
-    assistant_message: AssistantMessage,
-    tool_call: ToolCall,
-    config: AgentConfig,
-    signal: asyncio.Event | None,
-    emit: AgentEventSink,
-) -> ToolResultMessage:
-    await emit(AgentEvent(type="tool_execution_start", payload={
-        "tool_call_id": tool_call.id,
-        "tool_name": tool_call.name,
-        "args": tool_call.arguments
-    }))
-
-    tool = next((t for t in context.tools if t.name == tool_call.name), None)
-    if not tool:
-        return await finalize_tool_result(
-            tool_call, 
-            AgentToolResult(content=[TextContent(text=f"Tool {tool_call.name} not found")], details={"error": "not found"}), 
-            True, emit
-        )
-
-    try:
-        validated_args = validate_tool_arguments(tool, tool_call)
-        
-        if config.before_tool_call:
-            before_ctx = BeforeToolCallContext(assistant_message, tool_call, validated_args, context)
-            before_res = await config.before_tool_call(before_ctx, signal)
-            if before_res and before_res.block:
-                return await finalize_tool_result(
-                    tool_call,
-                    AgentToolResult(content=[TextContent(text=before_res.reason or "Tool blocked")], details={"error": "blocked"}),
-                    True, emit
-                )
-
-        async def on_update(partial: AgentToolResult[Any]):
-            await emit(AgentEvent(type="tool_execution_update", payload={
-                "tool_call_id": tool_call.id,
-                "tool_name": tool_call.name,
-                "partial_result": partial
-            }))
-
-        result = await tool.execute(tool_call.id, validated_args, signal, on_update)
-        is_error = False
-
-        if config.after_tool_call:
-            after_ctx = AfterToolCallContext(assistant_message, tool_call, validated_args, result, is_error, context)
-            after_res = await config.after_tool_call(after_ctx, signal)
-            if after_res:
-                if after_res.content is not None: result.content = after_res.content
-                if after_res.details is not None: result.details = after_res.details
-                if after_res.is_error is not None: is_error = after_res.is_error
-
-        return await finalize_tool_result(tool_call, result, is_error, emit)
-
-    except Exception as e:
-        return await finalize_tool_result(
-            tool_call,
-            AgentToolResult(content=[TextContent(text=str(e))], details={"error": str(e)}),
-            True, emit
-        )
-
-async def finalize_tool_result(
-    tool_call: ToolCall,
-    result: AgentToolResult[Any],
-    is_error: bool,
-    emit: AgentEventSink
-) -> ToolResultMessage:
-    await emit(AgentEvent(type="tool_execution_end", payload={
-        "tool_call_id": tool_call.id,
-        "tool_name": tool_call.name,
-        "result": result,
-        "is_error": is_error
-    }))
-
-    msg = ToolResultMessage(
-        tool_call_id=tool_call.id,
-        tool_name=tool_call.name,
-        content=result.content,
-        details=result.details,
-        is_error=is_error
-    )
-    
-    await emit(AgentEvent(type="message_start", payload={"message": msg}))
-    await emit(AgentEvent(type="message_end", payload={"message": msg}))
-    return msg
-
-
-class FauxProvider:
-    async def stream(
-        self, model: Model, context: Context, options: ProviderOptions | None = None
-    ) -> AssistantEventStream:
-        stream = AssistantEventStream()
-        msg = AssistantMessage(api=model.api, provider=model.provider, model=model.id)
-        
-        last_msg = context.messages[-1] if context.messages else None
-        
-        if isinstance(last_msg, ToolResultMessage):
-            stream.push(Event(type="start", payload={"partial": msg}))
-            stream.push(Event(type="text_start", payload={"partial": msg}))
-            text = f"I received the result for {last_msg.tool_name}: {last_msg.content[0].text if last_msg.content else 'empty'}"
-            msg.content.append(TextContent(text=text))
-            stream.push(Event(type="text_delta", payload={"delta": text, "partial": msg}))
-            stream.push(Event(type="text_end", payload={"partial": msg}))
-            stream.push(Event(type="done", payload={"reason": "stop", "message": msg}))
-        else:
-            stream.push(Event(type="start", payload={"partial": msg}))
-            last_user = next((m for m in reversed(context.messages) if isinstance(m, UserMessage)), None)
-            text = "ACK"
-            if last_user:
-                content = last_user.content if isinstance(last_user.content, str) else (last_user.content[0].text if last_user.content else "")
-                text = f"ACK: {content}"
-
-            if "call_tool" in text:
-                tool_name = next(
-                    (t.name for t in context.tools if t.name in text),
-                    context.tools[0].name if context.tools else "echo"
-                )
-                stream.push(Event(type="text_start", payload={"partial": msg}))
-                msg.content.append(TextContent(text=f"I will call the {tool_name} tool now."))
-                stream.push(Event(type="text_delta", payload={"delta": f"I will call the {tool_name} tool now.", "partial": msg}))
-                stream.push(Event(type="text_end", payload={"partial": msg}))
-                
-                call = ToolCall(id=str(uuid.uuid4()), name=tool_name, arguments={"message": text})
-                msg.content.append(call)
-                msg.stop_reason = "toolUse"
-                stream.push(Event(type="toolcall_start", payload={"partial": msg}))
-                stream.push(Event(type="toolcall_end", payload={"toolCall": call, "partial": msg}))
-                stream.push(Event(type="done", payload={"reason": "toolUse", "message": msg}))
-            else:
-                stream.push(Event(type="text_start", payload={"partial": msg}))
-                msg.content.append(TextContent(text=text))
-                stream.push(Event(type="text_delta", payload={"delta": text, "partial": msg}))
-                stream.push(Event(type="text_end", payload={"partial": msg}))
-                stream.push(Event(type="done", payload={"reason": "stop", "message": msg}))
-
-        stream.end(msg)
-        return stream
-
-
-class OpenAIResponsesProvider:
-    async def stream(
-        self, model: Model, context: Context, options: ProviderOptions | None = None
-    ) -> AssistantEventStream:
-        stream = AssistantEventStream()
-        opts = options or ProviderOptions()
-        base_url = opts.base_url or "https://api.openai.com/v1"
-
-        def format_content(content):
-            if isinstance(content, str): return content
-            return " ".join(c.text for c in content if isinstance(c, TextContent))
-
-        async with httpx.AsyncClient(timeout=opts.timeout_seconds) as client:
-            try:
-                req_body = {
-                    "model": model.id,
-                    "input": [{"role": getattr(m, "role", "user"), "content": format_content(m.content)} for m in context.messages],
-                }
-                if context.system_prompt: req_body["instructions"] = context.system_prompt
-                
-                resp = await client.post(
-                    f"{base_url}/responses",
-                    json=req_body,
-                    headers={"Authorization": f"Bearer {opts.api_key}"},
-                )
-                if resp.status_code >= 400:
-                    raise Exception(f"HTTP {resp.status_code}: {await resp.aread()}")
-                
-                data = resp.json()
-                text = data.get("output_text", "")
-
-                msg = AssistantMessage(api=model.api, provider=model.provider, model=model.id)
-                stream.push(Event(type="start", payload={"partial": msg}))
-                stream.push(Event(type="text_start", payload={"partial": msg}))
-                msg.content.append(TextContent(text=text))
-                stream.push(Event(type="text_delta", payload={"delta": text, "partial": msg}))
-                stream.push(Event(type="text_end", payload={"partial": msg}))
-                stream.push(Event(type="done", payload={"reason": "stop", "message": msg}))
-                stream.end(msg)
-            except Exception as e:
-                msg = AssistantMessage(api=model.api, provider=model.provider, model=model.id, stop_reason="error", error_message=str(e))
-                stream.push(Event(type="error", payload={"reason": "error", "error": msg}))
-                stream.end(msg)
-        return stream
-
-
-class AnthropicMessagesProvider:
-    async def stream(
-        self, model: Model, context: Context, options: ProviderOptions | None = None
-    ) -> AssistantEventStream:
-        stream = AssistantEventStream()
-        opts = options or ProviderOptions()
-        if not opts.api_key:
-            msg = AssistantMessage(api=model.api, provider=model.provider, model=model.id, stop_reason="error", error_message="missing api key")
-            stream.push(Event(type="error", payload={"reason": "error", "error": msg}))
-            stream.end(msg)
-            return stream
-
-        base_url = opts.base_url or "https://api.anthropic.com/v1"
-
-        def format_content(content):
-            if isinstance(content, str): return content
-            res = []
-            for item in content:
-                if isinstance(item, TextContent): res.append({"type": "text", "text": item.text})
-                elif isinstance(item, ImageContent): res.append({"type": "image", "source": {"type": "base64", "media_type": item.mime_type, "data": item.data}})
-                elif isinstance(item, ToolCall): res.append({"type": "tool_use", "id": item.id, "name": item.name, "input": item.arguments})
-            return res
-
-        messages = []
-        for m in context.messages:
-            role = getattr(m, "role", None)
-            if role == "user": messages.append({"role": "user", "content": format_content(m.content)})
-            elif role == "assistant": messages.append({"role": "assistant", "content": format_content(m.content)})
-            elif role == "toolResult":
-                messages.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": m.tool_call_id,
-                        "content": format_content(m.content),
-                        "is_error": getattr(m, "is_error", False)
-                    }]
-                })
-
-        payload = {
-            "model": model.id,
-            "max_tokens": opts.max_tokens or 1024,
-            "messages": messages,
-            "stream": True,
+    def schema(self) -> dict[str, Any]:
+        s = self.parameters.model_json_schema()
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": {
+                "type": "object",
+                "properties": s.get("properties", {}),
+                "required": s.get("required", []),
+                **( {"$defs": s["$defs"]} if "$defs" in s else {} ),
+            },
         }
-        if context.system_prompt: payload["system"] = [{"type": "text", "text": context.system_prompt}]
-        if opts.temperature is not None: payload["temperature"] = opts.temperature
-        
-        if context.tools:
-            anthropic_tools = []
-            for t in context.tools:
-                schema = t.parameters.model_json_schema()
-                anthropic_tools.append({
+
+
+def validate_tool_call(tool: Tool, call: ToolCall) -> BaseModel:
+    try:
+        return tool.parameters.model_validate(call.arguments)
+    except ValidationError as exc:
+        details = "; ".join(
+            f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}"
+            for e in exc.errors()
+        )
+        raise ValueError(f"Invalid arguments for '{tool.name}': {details}")
+
+_REASONING_BUDGET: dict[str, int] = {
+    "minimal": 512,
+    "low":     1_024,
+    "medium":  8_192,
+    "high":    16_000,
+    "xhigh":   32_000,
+}
+
+
+class AnthropicMessages:
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        *,
+        base_url: str = "https://api.anthropic.com/v1",
+        max_tokens: int = 8_192,
+        temperature: float | None = None,
+        reasoning: Literal["off", "minimal", "low", "medium", "high", "xhigh"] = "off",
+        tool_choice: Any = None,
+        mock: list[AssistantMessage] | None = None,
+    ) -> None:
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.reasoning = reasoning
+        self.tool_choice = tool_choice
+        self._mock: deque[AssistantMessage] = deque(mock) if mock else deque()
+
+    def _emit_mock(self, response: AssistantMessage) -> EventStream:
+        es = EventStream()
+
+        async def _run() -> None:
+            es.push(Event("start", {"partial": response}))
+            for block in response.content:
+                if isinstance(block, TextContent):
+                    es.push(Event("text_delta", {"delta": block.text, "partial": response}))
+                elif isinstance(block, ThinkingContent):
+                    es.push(Event("thinking_delta", {"delta": block.thinking, "partial": response}))
+                elif isinstance(block, ToolCall):
+                    es.push(Event("toolcall_end", {"tool_call": block, "partial": response}))
+            es.push(Event("done", {"reason": response.stop_reason, "message": response}))
+            es.finish(response)
+
+        task = asyncio.create_task(_run())
+        es._attach(task)
+        return es
+
+    def _fmt_content(
+        self,
+        content: str | list,
+    ) -> str | list[dict]:
+        if isinstance(content, str):
+            return content
+        out = []
+        for item in content:
+            if isinstance(item, TextContent):
+                blk: dict = {"type": "text", "text": item.text}
+                if item.cache_control:
+                    blk["cache_control"] = {"type": item.cache_control}
+                out.append(blk)
+            elif isinstance(item, ImageContent):
+                blk = {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": item.mime_type, "data": item.data},
+                }
+                if item.cache_control:
+                    blk["cache_control"] = {"type": item.cache_control}
+                out.append(blk)
+            elif isinstance(item, ThinkingContent):
+                if item.redacted:
+                    out.append({"type": "redacted_thinking", "data": item.thinking})
+                else:
+                    out.append({"type": "thinking", "thinking": item.thinking, "signature": item.signature or ""})
+            elif isinstance(item, ToolCall):
+                out.append({"type": "tool_use", "id": item.id, "name": item.name, "input": item.arguments})
+        return out
+
+    def _build_messages(self, messages: list[Message]) -> list[dict]:
+        out = []
+        i = 0
+        while i < len(messages):
+            m = messages[i]
+            if isinstance(m, UserMessage):
+                out.append({"role": "user", "content": self._fmt_content(m.content)})
+                i += 1
+            elif isinstance(m, AssistantMessage):
+                out.append({"role": "assistant", "content": self._fmt_content(m.content)})
+                i += 1
+            elif isinstance(m, ToolResultMessage):
+                batch = []
+                while i < len(messages) and isinstance(messages[i], ToolResultMessage):
+                    tr = messages[i]
+                    assert isinstance(tr, ToolResultMessage)
+                    batch.append({
+                        "type": "tool_result",
+                        "tool_use_id": tr.tool_call_id,
+                        "content": self._fmt_content(tr.content),
+                        "is_error": tr.is_error,
+                    })
+                    i += 1
+                out.append({"role": "user", "content": batch})
+            else:
+                i += 1
+        return out
+
+    async def stream(
+        self,
+        messages: list[Message],
+        system: str,
+        tools: list[Tool],
+    ) -> EventStream:
+        if self._mock:
+            return self._emit_mock(self._mock.popleft())
+
+        es = EventStream()
+
+        payload: dict[str, Any] = {
+            "model":      self.model,
+            "max_tokens": self.max_tokens,
+            "messages":   self._build_messages(messages),
+            "stream":     True,
+        }
+        if system:
+            payload["system"] = [{"type": "text", "text": system}]
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if self.reasoning != "off":
+            payload["thinking"] = {"type": "enabled", "budget_tokens": _REASONING_BUDGET[self.reasoning]}
+        if tools:
+            payload["tools"] = [t.schema() for t in tools]
+            if self.tool_choice is not None:
+                tc = self.tool_choice
+                if isinstance(tc, dict):
+                    payload["tool_choice"] = {"type": "tool", "name": tc["name"]}
+                elif tc == "required":
+                    payload["tool_choice"] = {"type": "any"}
+                elif tc == "none":
+                    payload["tool_choice"] = {"type": "none"}
+                else:
+                    payload["tool_choice"] = {"type": "auto"}
+
+        headers = {
+            "x-api-key":         self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type":      "application/json",
+        }
+
+        async def _run() -> None:
+            msg = AssistantMessage()
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream("POST", f"{self.base_url}/messages", json=payload, headers=headers) as resp:
+                        if resp.status_code >= 400:
+                            body = await resp.aread()
+                            raise RuntimeError(f"HTTP {resp.status_code}: {body.decode()}")
+
+                        es.push(Event("start", {"partial": msg}))
+
+                        _tool_buf: dict[int, str] = {}
+                        _block_idx: dict[int, int] = {}
+
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            if data == "[DONE]":
+                                break
+                            chunk = json.loads(data)
+                            etype = chunk.get("type")
+
+                            if etype == "message_start":
+                                u = chunk.get("message", {}).get("usage", {})
+                                msg.usage.input       = u.get("input_tokens", 0)
+                                msg.usage.cache_read  = u.get("cache_read_input_tokens", 0)
+                                msg.usage.cache_write = u.get("cache_creation_input_tokens", 0)
+
+                            elif etype == "content_block_start":
+                                idx = chunk.get("index", 0)
+                                blk = chunk.get("content_block", {})
+                                btype = blk.get("type")
+                                if btype == "text":
+                                    _block_idx[idx] = len(msg.content)
+                                    msg.content.append(TextContent(text=""))
+                                elif btype == "thinking":
+                                    _block_idx[idx] = len(msg.content)
+                                    msg.content.append(ThinkingContent(thinking=""))
+                                elif btype == "redacted_thinking":
+                                    _block_idx[idx] = len(msg.content)
+                                    msg.content.append(ThinkingContent(thinking="", redacted=True))
+                                elif btype == "tool_use":
+                                    _block_idx[idx] = len(msg.content)
+                                    msg.content.append(ToolCall(id=blk["id"], name=blk["name"], arguments={}))
+                                    _tool_buf[idx] = ""
+
+                            elif etype == "content_block_delta":
+                                idx = chunk.get("index", 0)
+                                delta = chunk.get("delta", {})
+                                dtype = delta.get("type")
+                                pos = _block_idx.get(idx)
+                                if pos is None:
+                                    continue
+
+                                if dtype == "text_delta":
+                                    text = delta.get("text", "")
+                                    blk = msg.content[pos]
+                                    if isinstance(blk, TextContent):
+                                        blk.text += text
+                                    es.push(Event("text_delta", {"delta": text, "partial": msg}))
+
+                                elif dtype == "thinking_delta":
+                                    chunk_text = delta.get("thinking", "")
+                                    blk = msg.content[pos]
+                                    if isinstance(blk, ThinkingContent):
+                                        blk.thinking += chunk_text
+                                    es.push(Event("thinking_delta", {"delta": chunk_text, "partial": msg}))
+
+                                elif dtype == "signature_delta":
+                                    sig = delta.get("signature", "")
+                                    blk = msg.content[pos]
+                                    if isinstance(blk, ThinkingContent):
+                                        blk.signature = (blk.signature or "") + sig
+
+                                elif dtype == "input_json_delta":
+                                    _tool_buf[idx] = _tool_buf.get(idx, "") + delta.get("partial_json", "")
+
+                            elif etype == "content_block_stop":
+                                idx = chunk.get("index", 0)
+                                pos = _block_idx.get(idx)
+                                if pos is not None and pos < len(msg.content):
+                                    blk = msg.content[pos]
+                                    if isinstance(blk, ToolCall):
+                                        raw = _tool_buf.pop(idx, "")
+                                        if raw:
+                                            try:
+                                                blk.arguments = json.loads(raw)
+                                            except json.JSONDecodeError:
+                                                pass
+                                        es.push(Event("toolcall_end", {"tool_call": blk, "partial": msg}))
+
+                            elif etype == "message_delta":
+                                delta = chunk.get("delta", {})
+                                reason = delta.get("stop_reason")
+                                if reason == "tool_use":
+                                    msg.stop_reason = "tool_use"
+                                elif reason == "max_tokens":
+                                    msg.stop_reason = "length"
+                                elif reason:
+                                    msg.stop_reason = "stop"
+                                u = chunk.get("usage", {})
+                                if u:
+                                    msg.usage.output = u.get("output_tokens", msg.usage.output)
+
+                            elif etype == "message_stop":
+                                es.push(Event("done", {"reason": msg.stop_reason, "message": msg}))
+
+            except Exception as exc:
+                msg.stop_reason = "error"
+                msg.error_message = str(exc)
+                es.push(Event("error", {"error": msg}))
+
+            es.finish(msg)
+
+        task = asyncio.create_task(_run())
+        es._attach(task)
+        return es
+
+class OpenAIChat:
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        *,
+        base_url: str = "https://api.openai.com/v1",
+        max_tokens: int = 8_192,
+        temperature: float | None = None,
+        tool_choice: Any = None,
+        mock: list[AssistantMessage] | None = None,
+    ) -> None:
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url.rstrip("/")
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.tool_choice = tool_choice
+        self._mock: deque[AssistantMessage] = deque(mock) if mock else deque()
+
+    def _emit_mock(self, response: AssistantMessage) -> EventStream:
+        es = EventStream()
+
+        async def _run() -> None:
+            es.push(Event("start", {"partial": response}))
+            for block in response.content:
+                if isinstance(block, TextContent):
+                    es.push(Event("text_delta", {"delta": block.text, "partial": response}))
+                elif isinstance(block, ThinkingContent):
+                    es.push(Event("thinking_delta", {"delta": block.thinking, "partial": response}))
+                elif isinstance(block, ToolCall):
+                    es.push(Event("toolcall_end", {"tool_call": block, "partial": response}))
+            es.push(Event("done", {"reason": response.stop_reason, "message": response}))
+            es.finish(response)
+
+        task = asyncio.create_task(_run())
+        es._attach(task)
+        return es
+
+    def _build_messages(self, messages: list[Message], system: str) -> list[dict]:
+        out = []
+        if system:
+            out.append({"role": "system", "content": system})
+        for m in messages:
+            if isinstance(m, UserMessage):
+                if isinstance(m.content, str):
+                    out.append({"role": "user", "content": m.content})
+                else:
+                    parts = []
+                    for item in m.content:
+                        if isinstance(item, TextContent):
+                            parts.append({"type": "text", "text": item.text})
+                        elif isinstance(item, ImageContent):
+                            parts.append({"type": "image_url", "image_url": {
+                                "url": f"data:{item.mime_type};base64,{item.data}"
+                            }})
+                    out.append({"role": "user", "content": parts})
+            elif isinstance(m, AssistantMessage):
+                text_parts = [b for b in m.content if isinstance(b, TextContent)]
+                tool_calls = [b for b in m.content if isinstance(b, ToolCall)]
+                msg: dict[str, Any] = {"role": "assistant"}
+                if text_parts:
+                    msg["content"] = "".join(b.text for b in text_parts)
+                if tool_calls:
+                    msg["tool_calls"] = [
+                        {"id": tc.id, "type": "function",
+                         "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)}}
+                        for tc in tool_calls
+                    ]
+                out.append(msg)
+            elif isinstance(m, ToolResultMessage):
+                content_val: str | list
+                if len(m.content) == 1 and isinstance(m.content[0], TextContent):
+                    content_val = m.content[0].text
+                else:
+                    content_val = [
+                        {"type": "text", "text": b.text} if isinstance(b, TextContent)
+                        else {"type": "image_url", "image_url": {"url": f"data:{b.mime_type};base64,{b.data}"}}
+                        for b in m.content
+                    ]
+                out.append({"role": "tool", "tool_call_id": m.tool_call_id, "content": content_val})
+        return out
+
+    async def stream(
+        self,
+        messages: list[Message],
+        system: str,
+        tools: list[Tool],
+    ) -> EventStream:
+        if self._mock:
+            return self._emit_mock(self._mock.popleft())
+
+        es = EventStream()
+
+        payload: dict[str, Any] = {
+            "model":      self.model,
+            "max_tokens": self.max_tokens,
+            "messages":   self._build_messages(messages, system),
+            "stream":     True,
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        if tools:
+            payload["tools"] = [
+                {"type": "function", "function": {
                     "name": t.name,
                     "description": t.description,
-                    "input_schema": {
+                    "parameters": {
                         "type": "object",
-                        "properties": schema.get("properties", {}),
-                        "required": schema.get("required", [])
-                    }
-                })
-            payload["tools"] = anthropic_tools
+                        "properties": t.parameters.model_json_schema().get("properties", {}),
+                        "required": t.parameters.model_json_schema().get("required", []),
+                    },
+                }}
+                for t in tools
+            ]
+            if self.tool_choice is not None:
+                tc = self.tool_choice
+                if isinstance(tc, dict):
+                    payload["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
+                else:
+                    payload["tool_choice"] = tc
 
-        async def run():
-            msg = AssistantMessage(api=model.api, provider=model.provider, model=model.id)
-            try:
-                async with httpx.AsyncClient(timeout=opts.timeout_seconds) as client:
-                    async with client.stream(
-                        "POST", f"{base_url}/messages", json=payload,
-                        headers={
-                            "x-api-key": opts.api_key,
-                            "anthropic-version": "2023-06-01",
-                            "content-type": "application/json",
-                        },
-                    ) as resp:
-                        if resp.status_code >= 400:
-                            raise Exception(f"HTTP {resp.status_code}: {await resp.aread()}")
-
-                        stream.push(Event(type="start", payload={"partial": msg}))
-                        _tool_arg_buf: dict[int, str] = {}  
-                        _block_index = 0
-                        async for line in resp.aiter_lines():
-                            if not line.startswith("data: "): continue
-                            data_str = line[6:]
-                            if data_str == "[DONE]": break
-                            chunk = json.loads(data_str)
-                            event_type = chunk.get("type")
-
-                            if event_type == "content_block_start":
-                                _block_index = chunk.get("index", _block_index)
-                                block = chunk.get("content_block", {})
-                                if block.get("type") == "text":
-                                    stream.push(Event(type="text_start", payload={"partial": msg}))
-                                    msg.content.append(TextContent(text=""))
-                                elif block.get("type") == "tool_use":
-                                    call = ToolCall(id=block["id"], name=block["name"], arguments={})
-                                    msg.content.append(call)
-                                    _tool_arg_buf[_block_index] = ""
-                                    stream.push(Event(type="toolcall_start", payload={"partial": msg}))
-                            elif event_type == "content_block_delta":
-                                idx = chunk.get("index", _block_index)
-                                delta = chunk.get("delta", {})
-                                if delta.get("type") == "text_delta":
-                                    text = delta.get("text", "")
-                                    if msg.content and isinstance(msg.content[-1], TextContent):
-                                        msg.content[-1].text += text
-                                    stream.push(Event(type="text_delta", payload={"delta": text, "partial": msg}))
-                                elif delta.get("type") == "input_json_delta":
-                                    _tool_arg_buf[idx] = _tool_arg_buf.get(idx, "") + delta.get("partial_json", "")
-                            elif event_type == "content_block_stop":
-                                idx = chunk.get("index", _block_index)
-                                if msg.content and isinstance(msg.content[-1], TextContent):
-                                    stream.push(Event(type="text_end", payload={"partial": msg}))
-                                elif msg.content and isinstance(msg.content[-1], ToolCall):
-                                    raw = _tool_arg_buf.pop(idx, "")
-                                    if raw:
-                                        try:
-                                            msg.content[-1].arguments = json.loads(raw)
-                                        except json.JSONDecodeError:
-                                            pass
-                                    stream.push(Event(type="toolcall_end", payload={"partial": msg}))
-                            elif event_type == "message_delta":
-                                if "stop_reason" in chunk.get("delta", {}):
-                                    reason = chunk["delta"]["stop_reason"]
-                                    msg.stop_reason = "toolUse" if reason == "tool_use" else "stop"
-                                if "usage" in chunk:
-                                    usage = chunk["usage"]
-                                    msg.usage.input = usage.get("input_tokens", 0)
-                                    msg.usage.output = usage.get("output_tokens", 0)
-                            elif event_type == "message_stop":
-                                stream.push(Event(type="done", payload={"reason": msg.stop_reason, "message": msg}))
-
-                stream.end(msg)
-            except Exception as e:
-                msg.stop_reason = "error"
-                msg.error_message = str(e)
-                stream.push(Event(type="error", payload={"reason": "error", "error": msg}))
-                stream.end(msg)
-
-        asyncio.create_task(run())
-        return stream
-
-
-class ProviderRegistry:
-    def __init__(self) -> None:
-        self._providers: dict[str, Provider] = {
-            "faux": FauxProvider(),
-            "openai-responses": OpenAIResponsesProvider(),
-            "anthropic-messages": AnthropicMessagesProvider(),
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type":  "application/json",
         }
 
-    def register(self, api: str, provider: Provider) -> None:
-        self._providers[api] = provider
+        async def _run() -> None:
+            msg = AssistantMessage()
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream("POST", f"{self.base_url}/chat/completions", json=payload, headers=headers) as resp:
+                        if resp.status_code >= 400:
+                            body = await resp.aread()
+                            raise RuntimeError(f"HTTP {resp.status_code}: {body.decode()}")
 
+                        es.push(Event("start", {"partial": msg}))
+
+                        _tc_state: dict[int, dict] = {}
+                        _text_buf = ""
+                        _text_started = False
+                        finish_reason: str | None = None
+
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:].strip()
+                            if data == "[DONE]":
+                                break
+                            if not data:
+                                continue
+                            chunk = json.loads(data)
+                            choice = (chunk.get("choices") or [{}])[0]
+                            delta = choice.get("delta", {})
+                            finish_reason = choice.get("finish_reason") or finish_reason
+
+                            if "content" in delta and delta["content"]:
+                                text = delta["content"]
+                                _text_buf += text
+                                if not _text_started:
+                                    _text_started = True
+                                es.push(Event("text_delta", {"delta": text, "partial": msg}))
+
+                            for tcd in delta.get("tool_calls") or []:
+                                idx = tcd.get("index", 0)
+                                if idx not in _tc_state:
+                                    fn = tcd.get("function", {})
+                                    _tc_state[idx] = {
+                                        "id":       tcd.get("id", str(uuid.uuid4())),
+                                        "name":     fn.get("name", ""),
+                                        "args_buf": fn.get("arguments", ""),
+                                    }
+                                else:
+                                    fn = tcd.get("function", {})
+                                    if "name" in fn:
+                                        _tc_state[idx]["name"] += fn["name"]
+                                    if "arguments" in fn:
+                                        _tc_state[idx]["args_buf"] += fn["arguments"]
+
+                            u = chunk.get("usage") or {}
+                            if u:
+                                msg.usage.input  = u.get("prompt_tokens", msg.usage.input)
+                                msg.usage.output = u.get("completion_tokens", msg.usage.output)
+
+                        if _text_buf:
+                            msg.content.append(TextContent(text=_text_buf))
+
+                        for _, state in sorted(_tc_state.items()):
+                            try:
+                                args = json.loads(state["args_buf"]) if state["args_buf"] else {}
+                            except json.JSONDecodeError:
+                                args = {}
+                            call = ToolCall(id=state["id"], name=state["name"], arguments=args)
+                            msg.content.append(call)
+                            es.push(Event("toolcall_end", {"tool_call": call, "partial": msg}))
+
+                        if finish_reason == "tool_calls":
+                            msg.stop_reason = "tool_use"
+                        elif finish_reason in ("length", "max_tokens"):
+                            msg.stop_reason = "length"
+                        else:
+                            msg.stop_reason = "stop"
+
+                        es.push(Event("done", {"reason": msg.stop_reason, "message": msg}))
+
+            except Exception as exc:
+                msg.stop_reason = "error"
+                msg.error_message = str(exc)
+                es.push(Event("error", {"error": msg}))
+
+            es.finish(msg)
+
+        task = asyncio.create_task(_run())
+        es._attach(task)
+        return es
+
+AgentEventType: TypeAlias = Literal[
+    "agent_start",
+    "agent_end",
+    "turn_start",
+    "turn_end",
+    "text_delta",
+    "thinking_delta",
+    "tool_start",
+    "tool_end",
+    "error",
+]
+
+
+@dataclass
+class AgentEvent:
+    type: AgentEventType
+    payload: dict[str, Any] = field(default_factory=dict)
+
+class API:
     async def stream(
-        self, model: Model, context: Context, options: ProviderOptions | None = None
-    ) -> AssistantEventStream:
-        provider = self._providers.get(model.api)
-        if not provider: raise ValueError(f"Provider for API {model.api} not found")
-        return await provider.stream(model, context, options)
+        self,
+        messages: list[Message],
+        system: str,
+        tools: list[Tool],
+    ) -> EventStream: ...
 
 
 class Agent:
-    def __init__(self, context: Context, registry: ProviderRegistry | None = None) -> None:
-        self.context = context
-        self.registry = registry or ProviderRegistry()
-        self.tools: list[AgentTool] = []
-        self.config = AgentConfig()
-        self.provider_options = ProviderOptions()
-        self._listeners: set[Callable[[AgentEvent], Awaitable[None]]] = set()
+    def __init__(
+        self,
+        api: Any,
+        system: str = "",
+        tools: list[Tool] | None = None,
+    ) -> None:
+        self.api = api
+        self.system = system
+        self.tools: list[Tool] = tools or []
+        self.messages: list[Message] = []
+        self._signal: asyncio.Event | None = None
+        self._listeners: set[Callable] = set()
 
-    def subscribe(self, listener: Callable[[AgentEvent], Awaitable[None]]) -> Callable[[], None]:
-        self._listeners.add(listener)
-        return lambda: self._listeners.remove(listener)
+    async def run(self, prompt: str) -> AssistantMessage:
+        if self._signal is None or not self._signal.is_set():
+            self._signal = None
+        self.messages.append(UserMessage(content=prompt))
+        return await self._loop()
 
-    async def _emit(self, event: AgentEvent) -> None:
-        if not self._listeners: return
-        await asyncio.gather(*(l(event) for l in self._listeners))
+    def abort(self) -> None:
+        if self._signal is None:
+            self._signal = asyncio.Event()
+        self._signal.set()
 
-    async def prompt(self, text: str) -> list[Message]:
-        msg = UserMessage(content=text)
-        self.context.messages.append(msg)
-        await self._emit(AgentEvent(type="message_start", payload={"message": msg}))
-        await self._emit(AgentEvent(type="message_end", payload={"message": msg}))
-        return await self.continue_run()
+    def branch(self) -> "Agent":
+        child = Agent(api=self.api, system=self.system, tools=list(self.tools))
+        child.messages = list(self.messages)
+        return child
 
-    async def continue_run(self) -> list[Message]:
-        return await run_agent_loop(
-            self.context,
-            self._emit,
-            self.registry,
-            self.tools,
-            self.config,
-            self.provider_options,
+    def subscribe(self, fn: Callable[[AgentEvent], Any]) -> Callable:
+        self._listeners.add(fn)
+        return lambda: self._listeners.discard(fn)
+
+    async def _emit(self, event: agentevent) -> none:
+        for fn in list(self._listeners):
+            result = fn(event)
+            if asyncio.iscoroutine(result):
+                await result
+
+    async def _loop(self) -> assistantmessage:
+        await self._emit(agentevent("agent_start"))
+        final: assistantmessage = assistantmessage(stop_reason="error",
+                                                    error_message="no turns ran")
+        while true:
+            await self._emit(agentevent("turn_start"))
+
+            es = await self.api.stream(self.messages, self.system, self.tools)
+
+            async for event in es:
+                if event.type == "text_delta":
+                    await self._emit(agentevent("text_delta", event.payload))
+                elif event.type == "thinking_delta":
+                    await self._emit(agentevent("thinking_delta", event.payload))
+                elif event.type == "error":
+                    await self._emit(agentevent("error", event.payload))
+
+            final = await es.result()
+            self.messages.append(final)
+
+            await self._emit(agentevent("turn_end", {"message": final}))
+
+            if final.stop_reason in ("error", "aborted"):
+                break
+
+            if self._signal and self._signal.is_set():
+                final.stop_reason = "aborted"
+                break
+
+            tool_calls = [b for b in final.content if isinstance(b, toolcall)]
+            if not tool_calls:
+                break
+
+            results = await self._execute_tools(tool_calls)
+            self.messages.extend(results)
+
+            if self._signal and self._signal.is_set():
+                final.stop_reason = "aborted"
+                break
+
+        await self._emit(agentevent("agent_end", {"message": final}))
+        return final
+
+    async def _execute_tools(self, calls: list[toolcall]) -> list[toolresultmessage]:
+        return list(await asyncio.gather(*[self._execute_one(c) for c in calls]))
+
+    async def _execute_one(self, call: toolcall) -> toolresultmessage:
+        await self._emit(agentevent("tool_start", {"name": call.name, "args": call.arguments}))
+
+        tool = next((t for t in self.tools if t.name == call.name), none)
+        if tool is none:
+            result = toolresult(
+                content=[textcontent(f"tool '{call.name}' not found")],
+                is_error=true,
+            )
+        else:
+            try:
+                params = validate_tool_call(tool, call)
+                result = await tool.execute(params, self._signal)
+            except exception as exc:
+                result = toolresult(content=[textcontent(str(exc))], is_error=true)
+
+        msg = toolresultmessage(
+            tool_call_id=call.id,
+            tool_name=call.name,
+            content=result.content,
+            is_error=result.is_error,
         )
+        await self._emit(agentevent("tool_end", {
+            "name": call.name, "is_error": result.is_error, "result": msg,
+        }))
+        return msg
 
-class EchoParams(BaseModel):
-    message: str = Field(description="The message to echo back")
 
-class EchoTool(AgentTool):
-    name = "echo"
-    description = "Echos back the input message"
-    parameters = EchoParams
-    label = "Echo Tool"
+_MAX_BYTES = 50 * 1024
+_MAX_LINES = 2_000
+_FILE_LOCKS: dict[str, asyncio.Lock] = {}
+_FILE_LOCKS_GUARD = asyncio.Lock()
 
-    async def execute(self, tool_call_id, params: EchoParams, signal=None, on_update=None) -> AgentToolResult[dict]:
-        if on_update:
-            await on_update(AgentToolResult(content=[TextContent(text="[Thinking about echoing...]")], details={}))
-            await asyncio.sleep(0.1)
-        return AgentToolResult(
-            content=[TextContent(text=f"Echo: {params.message}")],
-            details={"echoed": params.message}
-        )
 
-import os
-import re
-import shlex
-import fnmatch
-import subprocess
-import pathlib
+async def _file_lock(path: str) -> asyncio.Lock:
+    async with _FILE_LOCKS_GUARD:
+        if path not in _FILE_LOCKS:
+            _FILE_LOCKS[path] = asyncio.Lock()
+        return _FILE_LOCKS[path]
 
-_MAX_BYTES = 50 * 1024   # 50 KB
-_MAX_LINES = 2000
 
 def _truncate(text: str, label: str = "") -> str:
-    """Hard-cap output to 50 KB / 2000 lines, whichever comes first."""
     lines = text.splitlines(keepends=True)
     if len(lines) > _MAX_LINES:
-        lines = lines[:_MAX_LINES]
-        text = "".join(lines) + f"\n[truncated at {_MAX_LINES} lines{': ' + label if label else ''}]"
-    if len(text.encode()) > _MAX_BYTES:
-        text = text.encode()[:_MAX_BYTES].decode(errors="replace") + f"\n[truncated at 50 KB{': ' + label if label else ''}]"
+        text = "".join(lines[:_MAX_LINES])
+        text += f"\n[truncated at {_MAX_LINES} lines{': ' + label if label else ''}]"
+    encoded = text.encode()
+    if len(encoded) > _MAX_BYTES:
+        text = encoded[:_MAX_BYTES].decode(errors="replace")
+        text += f"\n[truncated at 50 KB{': ' + label if label else ''}]"
     return text
 
-def _resolve(path: str, cwd: str) -> str:
-    """Resolve path relative to cwd, preventing directory traversal above cwd."""
-    base = pathlib.Path(cwd).resolve()
-    resolved = (base / path).resolve()
-    try:
-        resolved.relative_to(base)
-    except ValueError:
-        raise ValueError(f"Path '{path}' escapes working directory '{cwd}'")
-    return str(resolved)
 
+def _resolve(path: str, cwd: str) -> str:
+    path = path.lstrip("@")
+    base = pathlib.Path(cwd).resolve()
+    candidate = (base / path).resolve()
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        raise ValueError(f"Path '{path}' escapes working directory")
+    return str(candidate)
+
+
+def _gitignore_patterns(dirpath: str) -> list[str]:
+    patterns: list[str] = []
+    current = pathlib.Path(dirpath).resolve()
+    visited: list[pathlib.Path] = []
+    while True:
+        visited.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    for d in reversed(visited):
+        gi = d / ".gitignore"
+        if gi.exists():
+            try:
+                for ln in gi.read_text(encoding="utf-8", errors="replace").splitlines():
+                    ln = ln.strip()
+                    if ln and not ln.startswith("#") and not ln.startswith("!"):
+                        patterns.append(ln)
+            except OSError:
+                pass
+    return patterns
+
+
+def _is_gitignored(name: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(name + "/", p) for p in patterns)
 
 
 class ReadParams(BaseModel):
     path: str = Field(description="File path to read (relative to cwd)")
-    offset: int | None = Field(default=None, description="Start line (1-based, inclusive)")
-    limit: int | None = Field(default=None, description="Max number of lines to read")
+    offset: int | None = Field(default=None, description="Start line (1-based)")
+    limit: int | None = Field(default=None, description="Max lines to read")
 
-class ReadTool(AgentTool):
-    name = "read"
-    description = (
-        "Read the contents of a file. "
-        "Supports optional line-range with offset (1-based) and limit. "
-        "Use this instead of cat or sed."
-    )
+
+class ReadTool(Tool):
+    name = "Read"
+    description = "Read a file. Use offset/limit for large files instead of reading the whole thing."
     parameters = ReadParams
-    label = "Read"
 
     def __init__(self, cwd: str | None = None) -> None:
         self.cwd = cwd or os.getcwd()
 
-    async def execute(self, tool_call_id, params: ReadParams, signal=None, on_update=None) -> AgentToolResult[dict]:
+    async def execute(self, params: ReadParams, signal=None) -> ToolResult:
         path = _resolve(params.path, self.cwd)
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                lines = fh.readlines()
+            lines = pathlib.Path(path).read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
         except FileNotFoundError:
             raise ValueError(f"File not found: {params.path}")
         except IsADirectoryError:
             raise ValueError(f"Path is a directory: {params.path}")
-
-        start = (params.offset - 1) if params.offset else 0
-        start = max(0, start)
+        start = max(0, (params.offset - 1) if params.offset else 0)
         end = (start + params.limit) if params.limit else len(lines)
-        sliced = lines[start:end]
-        text = "".join(sliced)
-        total = len(lines)
-        header = f"# {params.path}  (lines {start+1}-{min(end, total)} of {total})\n"
-        return AgentToolResult(
-            content=[TextContent(text=_truncate(header + text, params.path))],
-            details={"path": path, "total_lines": total}
-        )
-
+        header = f"# {params.path}  (lines {start+1}–{min(end, len(lines))} of {len(lines)})\n"
+        return ToolResult(content=[TextContent(_truncate(header + "".join(lines[start:end]), params.path))])
 
 
 class WriteParams(BaseModel):
     path: str = Field(description="File path to create or overwrite (relative to cwd)")
-    content: str = Field(description="Full content to write")
+    content: str = Field(description="Full file content")
 
-class WriteTool(AgentTool):
-    name = "write"
-    description = (
-        "Create a new file or completely overwrite an existing file. "
-        "Use for new files or full rewrites; prefer edit for surgical changes."
-    )
+
+class WriteTool(Tool):
+    name = "Write"
+    description = "Create or overwrite a file. Prefer 'edit' for small changes to existing files."
     parameters = WriteParams
-    label = "Write"
 
     def __init__(self, cwd: str | None = None) -> None:
         self.cwd = cwd or os.getcwd()
 
-    async def execute(self, tool_call_id, params: WriteParams, signal=None, on_update=None) -> AgentToolResult[dict]:
+    async def execute(self, params: WriteParams, signal=None) -> ToolResult:
         path = _resolve(params.path, self.cwd)
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        existed = os.path.exists(path)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(params.content)
+        lock = await _file_lock(path)
+        async with lock:
+            pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
+            existed = pathlib.Path(path).exists()
+            pathlib.Path(path).write_text(params.content, encoding="utf-8")
         action = "overwrote" if existed else "created"
         lines = params.content.count("\n") + 1
-        return AgentToolResult(
-            content=[TextContent(text=f"{action} {params.path} ({lines} lines)")],
-            details={"path": path, "action": action, "lines": lines}
-        )
-
+        return ToolResult(content=[TextContent(f"{action} {params.path} ({lines} lines)")])
 
 
 class EditParams(BaseModel):
     path: str = Field(description="File path to edit (relative to cwd)")
-    old_text: str = Field(description="Exact text to find (must match exactly once)")
+    old_text: str = Field(description="Exact text to replace (must appear exactly once)")
     new_text: str = Field(description="Replacement text")
 
-class EditTool(AgentTool):
-    name = "edit"
-    description = (
-        "Make a surgical edit to a file by replacing an exact string occurrence. "
-        "old_text must appear exactly once in the file. "
-        "Use read to inspect the file before editing."
-    )
+
+class EditTool(Tool):
+    name = "Edit"
+    description = "Replace an exact unique string in a file. Read the file first if unsure of exact text."
     parameters = EditParams
-    label = "Edit"
 
     def __init__(self, cwd: str | None = None) -> None:
         self.cwd = cwd or os.getcwd()
 
-    async def execute(self, tool_call_id, params: EditParams, signal=None, on_update=None) -> AgentToolResult[dict]:
+    async def execute(self, params: EditParams, signal=None) -> ToolResult:
         path = _resolve(params.path, self.cwd)
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                original = fh.read()
-        except FileNotFoundError:
-            raise ValueError(f"File not found: {params.path}")
-
-        count = original.count(params.old_text)
-        if count == 0:
-            raise ValueError(f"old_text not found in {params.path}")
-        if count > 1:
-            raise ValueError(
-                f"old_text appears {count} times in {params.path}; "
-                "make it more specific so it matches exactly once"
-            )
-
-        updated = original.replace(params.old_text, params.new_text, 1)
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(updated)
-
-        old_lines = params.old_text.count("\n") + 1
-        new_lines = params.new_text.count("\n") + 1
-        return AgentToolResult(
-            content=[TextContent(text=f"edited {params.path}: replaced {old_lines} line(s) with {new_lines} line(s)")],
-            details={"path": path, "old_lines": old_lines, "new_lines": new_lines}
-        )
-
+        lock = await _file_lock(path)
+        async with lock:
+            try:
+                original = pathlib.Path(path).read_text(encoding="utf-8")
+            except FileNotFoundError:
+                raise ValueError(f"File not found: {params.path}")
+            count = original.count(params.old_text)
+            if count == 0:
+                raise ValueError(f"old_text not found in {params.path}")
+            if count > 1:
+                raise ValueError(f"old_text appears {count} times in {params.path}; make it more specific")
+            pathlib.Path(path).write_text(original.replace(params.old_text, params.new_text, 1), encoding="utf-8")
+        return ToolResult(content=[TextContent(
+            f"edited {params.path}: replaced {params.old_text.count(chr(10))+1} line(s) "
+            f"with {params.new_text.count(chr(10))+1} line(s)"
+        )])
 
 
 class BashParams(BaseModel):
     command: str = Field(description="Shell command to execute")
-    timeout: int | None = Field(default=120, description="Timeout in seconds (default 120)")
+    timeout: int = Field(default=120, description="Timeout in seconds")
 
-class BashTool(AgentTool):
-    name = "bash"
-    description = (
-        "Execute a bash command synchronously and return stdout+stderr. "
-        "Use grep/find/ls tools for file exploration instead of bash. "
-        "Commands run in cwd. No background processes."
-    )
+
+class BashTool(Tool):
+    name = "Bash"
+    description = "Run a shell command, get stdout+stderr. Prefer read/grep/find/ls for file exploration."
     parameters = BashParams
-    label = "Bash"
 
     def __init__(self, cwd: str | None = None) -> None:
         self.cwd = cwd or os.getcwd()
 
-    async def execute(self, tool_call_id, params: BashParams, signal=None, on_update=None) -> AgentToolResult[dict]:
-        timeout = params.timeout or 120
+    async def execute(self, params: BashParams, signal=None) -> ToolResult:
+        proc = await asyncio.create_subprocess_shell(
+            params.command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=self.cwd,
+        )
         try:
-            proc = await asyncio.create_subprocess_shell(
-                params.command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=self.cwd,
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
-                raise ValueError(f"Command timed out after {timeout}s: {params.command}")
-            output = stdout.decode(errors="replace")
-            exit_code = proc.returncode
-        except Exception as e:
-            raise ValueError(f"bash error: {e}") from e
-
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=params.timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise ValueError(f"Command timed out after {params.timeout}s")
+        output = stdout.decode(errors="replace")
+        exit_code = proc.returncode or 0
         result = f"$ {params.command}\n{output}"
         if exit_code != 0:
             result += f"\n[exit code {exit_code}]"
-
-        is_error = exit_code != 0
-        return AgentToolResult(
-            content=[TextContent(text=_truncate(result, params.command))],
-            details={"exit_code": exit_code, "command": params.command}
-        )
-
+        return ToolResult(content=[TextContent(_truncate(result, params.command))])
 
 
 class GrepParams(BaseModel):
-    pattern: str = Field(description="Regex or literal pattern to search for")
-    path: str | None = Field(default=None, description="Directory or file to search (default: cwd)")
+    pattern: str = Field(description="Regex or literal pattern")
+    path: str | None = Field(default=None, description="Directory or file (default: cwd)")
     glob: str | None = Field(default=None, description="File glob filter e.g. '*.py'")
-    ignore_case: bool = Field(default=False, description="Case-insensitive match")
-    literal: bool = Field(default=False, description="Treat pattern as a literal string")
-    context: int | None = Field(default=None, description="Lines of context before/after match")
-    limit: int | None = Field(default=100, description="Max matches to return")
+    ignore_case: bool = Field(default=False)
+    literal: bool = Field(default=False, description="Treat pattern as literal string")
+    context: int | None = Field(default=None, description="Lines of context around each match")
+    limit: int = Field(default=100, description="Max matches to return")
 
-class GrepTool(AgentTool):
-    name = "grep"
-    description = (
-        "Search files for a regex or literal pattern. "
-        "Respects .gitignore. Faster than using bash grep for codebase exploration."
-    )
+
+class GrepTool(Tool):
+    name = "Grep"
+    description = "Search files for a pattern. Respects .gitignore."
     parameters = GrepParams
-    label = "Grep"
 
     def __init__(self, cwd: str | None = None) -> None:
         self.cwd = cwd or os.getcwd()
 
-    async def execute(self, tool_call_id, params: GrepParams, signal=None, on_update=None) -> AgentToolResult[dict]:
+    async def execute(self, params: GrepParams, signal=None) -> ToolResult:
         search_root = _resolve(params.path, self.cwd) if params.path else self.cwd
-        limit = params.limit if params.limit is not None else 100
-
+        flags = re.IGNORECASE if params.ignore_case else 0
         try:
-            raw_pattern = params.pattern if params.literal else params.pattern
-            flags = re.IGNORECASE if params.ignore_case else 0
-            if params.literal:
-                compiled = re.compile(re.escape(params.pattern), flags)
-            else:
-                compiled = re.compile(params.pattern, flags)
-        except re.error as e:
-            raise ValueError(f"Invalid regex pattern: {e}")
-
-        matches: list[str] = []
-        count = 0
-
-        def _matches_glob(filename: str) -> bool:
-            if not params.glob:
-                return True
-            return fnmatch.fnmatch(filename, params.glob)
-
-        def _is_gitignored(dirpath: str, entries: list[str]) -> set[str]:
-            """Simple .gitignore line matching (prefix/exact only)."""
-            gitignore = os.path.join(dirpath, ".gitignore")
-            ignored: set[str] = set()
-            if os.path.exists(gitignore):
-                with open(gitignore) as f:
-                    patterns = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-                for entry in entries:
-                    for p in patterns:
-                        if fnmatch.fnmatch(entry, p) or fnmatch.fnmatch(entry + "/", p):
-                            ignored.add(entry)
-            return ignored
+            compiled = re.compile(re.escape(params.pattern) if params.literal else params.pattern, flags)
+        except re.error as exc:
+            raise ValueError(f"Invalid regex: {exc}")
 
         search_path = pathlib.Path(search_root)
-
         if search_path.is_file():
             file_list = [search_path]
         else:
             file_list = []
             for dirpath, dirnames, filenames in os.walk(search_root):
-                ignored = _is_gitignored(dirpath, dirnames + filenames)
-                dirnames[:] = [d for d in dirnames if d not in ignored and not d.startswith(".")]
+                gi = _gitignore_patterns(dirpath)
+                dirnames[:] = [d for d in dirnames if not d.startswith(".") and not _is_gitignored(d, gi)]
                 for fname in filenames:
-                    if fname not in ignored and _matches_glob(fname):
-                        file_list.append(pathlib.Path(dirpath) / fname)
+                    if _is_gitignored(fname, gi):
+                        continue
+                    if params.glob and not fnmatch.fnmatch(fname, params.glob):
+                        continue
+                    file_list.append(pathlib.Path(dirpath) / fname)
+
+        matches: list[str] = []
+        count = 0
+        ctx = params.context or 0
 
         for fpath in file_list:
-            if count >= limit:
+            if count >= params.limit:
                 break
             try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
-                    file_lines = fh.readlines()
+                file_lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
             except (OSError, IsADirectoryError):
                 continue
-
             rel = os.path.relpath(str(fpath), self.cwd)
-            ctx = params.context or 0
-
+            emitted: set[int] = set()
             for i, line in enumerate(file_lines):
-                if count >= limit:
+                if count >= params.limit:
                     break
                 if compiled.search(line):
-                    start = max(0, i - ctx)
-                    end = min(len(file_lines), i + ctx + 1)
-                    for j in range(start, end):
-                        sep = ":" if j == i else "-"
-                        matches.append(f"{rel}:{j+1}{sep}{file_lines[j].rstrip()}")
-                    if ctx > 0:
+                    for j in range(max(0, i - ctx), min(len(file_lines), i + ctx + 1)):
+                        if j not in emitted:
+                            sep = ":" if j == i else "-"
+                            matches.append(f"{rel}:{j+1}{sep}{file_lines[j]}")
+                            emitted.add(j)
+                    if ctx:
                         matches.append("--")
                     count += 1
 
@@ -1160,453 +1070,505 @@ class GrepTool(AgentTool):
             text = f"No matches for '{params.pattern}'"
         else:
             text = "\n".join(matches)
-            if count >= limit:
-                text += f"\n[truncated at {limit} matches]"
-
-        return AgentToolResult(
-            content=[TextContent(text=_truncate(text))],
-            details={"match_count": count, "pattern": params.pattern}
-        )
-
+            if count >= params.limit:
+                text += f"\n[truncated at {params.limit} matches]"
+        return ToolResult(content=[TextContent(text)])
 
 
 class FindParams(BaseModel):
-    pattern: str = Field(description="Glob pattern e.g. '**/*.py'")
-    path: str | None = Field(default=None, description="Search root directory (default: cwd)")
-    limit: int | None = Field(default=1000, description="Max results")
+    path: str | None = Field(default=None, description="Directory to search (default: cwd)")
+    pattern: str | None = Field(default=None, description="Filename glob pattern e.g. '*.py'")
+    type: Literal["file", "dir", "any"] = Field(default="any")
+    limit: int = Field(default=200)
 
-class FindTool(AgentTool):
-    name = "find"
-    description = (
-        "Find files matching a glob pattern. "
-        "Respects .gitignore. Use instead of bash find for codebase exploration."
-    )
+
+class FindTool(Tool):
+    name = "Find"
+    description = "Find files or directories by name pattern. Respects .gitignore."
     parameters = FindParams
-    label = "Find"
 
     def __init__(self, cwd: str | None = None) -> None:
         self.cwd = cwd or os.getcwd()
 
-    async def execute(self, tool_call_id, params: FindParams, signal=None, on_update=None) -> AgentToolResult[dict]:
+    async def execute(self, params: FindParams, signal=None) -> ToolResult:
         search_root = _resolve(params.path, self.cwd) if params.path else self.cwd
-        limit = params.limit if params.limit is not None else 1000
-
         results: list[str] = []
-
-        def _is_gitignored_name(name: str, dirpath: str) -> bool:
-            gitignore = os.path.join(dirpath, ".gitignore")
-            if os.path.exists(gitignore):
-                with open(gitignore) as f:
-                    patterns = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-                for p in patterns:
-                    if fnmatch.fnmatch(name, p):
-                        return True
-            return False
-
-        pattern = params.pattern
-        simple = pattern.lstrip("*/")
-
         for dirpath, dirnames, filenames in os.walk(search_root):
-            dirnames[:] = [
-                d for d in dirnames
-                if not d.startswith(".") and not _is_gitignored_name(d, dirpath)
-            ]
-            for fname in filenames:
-                if len(results) >= limit:
-                    break
-                full = os.path.join(dirpath, fname)
-                rel = os.path.relpath(full, self.cwd)
-                if fnmatch.fnmatch(fname, simple) or fnmatch.fnmatch(rel, pattern):
-                    results.append(rel)
-            if len(results) >= limit:
+            gi = _gitignore_patterns(dirpath)
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and not _is_gitignored(d, gi)]
+            if params.type in ("dir", "any"):
+                for d in dirnames:
+                    if params.pattern and not fnmatch.fnmatch(d, params.pattern):
+                        continue
+                    results.append(os.path.relpath(os.path.join(dirpath, d), self.cwd) + "/")
+            if params.type in ("file", "any"):
+                for f in filenames:
+                    if _is_gitignored(f, gi):
+                        continue
+                    if params.pattern and not fnmatch.fnmatch(f, params.pattern):
+                        continue
+                    results.append(os.path.relpath(os.path.join(dirpath, f), self.cwd))
+            if len(results) >= params.limit:
+                results = results[:params.limit]
+                results.append(f"[truncated at {params.limit} results]")
                 break
-
-        if not results:
-            text = f"No files matching '{params.pattern}'"
-        else:
-            text = "\n".join(sorted(results))
-            if len(results) >= limit:
-                text += f"\n[truncated at {limit} results]"
-
-        return AgentToolResult(
-            content=[TextContent(text=_truncate(text))],
-            details={"count": len(results), "pattern": params.pattern}
-        )
-
+        text = "\n".join(results) if results else "No results"
+        return ToolResult(content=[TextContent(text)])
 
 
 class LsParams(BaseModel):
     path: str | None = Field(default=None, description="Directory to list (default: cwd)")
-    limit: int | None = Field(default=500, description="Max entries")
 
-class LsTool(AgentTool):
-    name = "ls"
-    description = (
-        "List directory contents with file sizes and types. "
-        "Respects .gitignore. Use instead of bash ls for codebase exploration."
-    )
+
+class LsTool(Tool):
+    name = "Ls"
+    description = "List directory contents. Respects .gitignore."
     parameters = LsParams
-    label = "Ls"
 
     def __init__(self, cwd: str | None = None) -> None:
         self.cwd = cwd or os.getcwd()
 
-    async def execute(self, tool_call_id, params: LsParams, signal=None, on_update=None) -> AgentToolResult[dict]:
-        dir_path = _resolve(params.path, self.cwd) if params.path else self.cwd
-        limit = params.limit if params.limit is not None else 500
-
-        if not os.path.isdir(dir_path):
+    async def execute(self, params: LsParams, signal=None) -> ToolResult:
+        target = _resolve(params.path, self.cwd) if params.path else self.cwd
+        p = pathlib.Path(target)
+        if not p.is_dir():
             raise ValueError(f"Not a directory: {params.path or '.'}")
-
-        gitignore_patterns: list[str] = []
-        gi = os.path.join(dir_path, ".gitignore")
-        if os.path.exists(gi):
-            with open(gi) as f:
-                gitignore_patterns = [l.strip() for l in f if l.strip() and not l.startswith("#")]
-
-        def is_ignored(name: str) -> bool:
-            for p in gitignore_patterns:
-                if fnmatch.fnmatch(name, p):
-                    return True
-            return False
-
+        gi = _gitignore_patterns(target)
         entries = []
-        try:
-            raw = sorted(os.listdir(dir_path))
-        except PermissionError:
-            raise ValueError(f"Permission denied: {params.path or '.'}")
-
-        for name in raw:
-            if is_ignored(name):
+        for entry in sorted(p.iterdir()):
+            if entry.name.startswith(".") or _is_gitignored(entry.name, gi):
                 continue
-            full = os.path.join(dir_path, name)
-            try:
-                stat = os.stat(full)
-                is_dir = os.path.isdir(full)
-                size = stat.st_size
-                entries.append((name, is_dir, size))
-            except OSError:
-                entries.append((name, False, 0))
-
-        truncated = entries[:limit]
-        rel_dir = os.path.relpath(dir_path, self.cwd)
-        lines = [f"{rel_dir}/"]
-        for name, is_dir, size in truncated:
-            if is_dir:
-                lines.append(f"  {name}/")
-            else:
-                size_str = f"{size:,}" if size < 1024 * 1024 else f"{size / (1024*1024):.1f}M"
-                lines.append(f"  {name}  ({size_str} bytes)")
-
-        if len(entries) > limit:
-            lines.append(f"[truncated at {limit} entries, {len(entries)} total]")
-
-        return AgentToolResult(
-            content=[TextContent(text="\n".join(lines))],
-            details={"path": dir_path, "count": len(truncated)}
-        )
+            entries.append(entry.name + ("/" if entry.is_dir() else ""))
+        return ToolResult(content=[TextContent("\n".join(entries) if entries else "(empty)")])
 
 
-
-def create_coding_tools(cwd: str | None = None) -> list[AgentTool]:
-    """read + write + edit + bash — the default coding agent set."""
+def coding_tools(cwd: str | None = None) -> list[Tool]:
     return [ReadTool(cwd), WriteTool(cwd), EditTool(cwd), BashTool(cwd)]
 
-def create_read_only_tools(cwd: str | None = None) -> list[AgentTool]:
-    """read + grep + find + ls — safe exploration without modification."""
+
+def readonly_tools(cwd: str | None = None) -> list[Tool]:
     return [ReadTool(cwd), GrepTool(cwd), FindTool(cwd), LsTool(cwd)]
 
-def create_all_tools(cwd: str | None = None) -> list[AgentTool]:
-    """All 7 tools."""
+
+def all_tools(cwd: str | None = None) -> list[Tool]:
     return [ReadTool(cwd), WriteTool(cwd), EditTool(cwd), BashTool(cwd),
             GrepTool(cwd), FindTool(cwd), LsTool(cwd)]
 
 
+_PASS = 0
+_FAIL = 0
+
 
 def _ok(label: str) -> None:
+    global _PASS
+    _PASS += 1
     print(f"  ✓ {label}")
 
-def _fail(label: str, err: Any) -> None:
-    print(f"  ✗ {label}: {err}")
 
-async def simulate():
-    """
-    Smoke-tests all 7 pi coding tools against a real temp directory,
-    plus the original echo/validation simulation.
-    """
-    import tempfile
+def _fail(label: str, reason: Any = "") -> None:
+    global _FAIL
+    _FAIL += 1
+    print(f"  ✗ {label}: {reason}")
 
-    print("=== pie.py simulation ===\n")
 
-    print("--- Part 1: Echo / Faux-Agent ---")
-    context = Context(
-        model_id="faux-model",
-        provider="faux-provider",
-        api="faux",
-        system_prompt="You are a helpful assistant with tools."
-    )
-    agent = Agent(context)
-    agent.tools = [EchoTool()]
+async def simulate() -> None:
+    global _PASS, _FAIL
+    _PASS = _FAIL = 0
 
-    async def logger(event: AgentEvent):
-        if event.type == "agent_start": print("[Agent Start]")
-        elif event.type == "turn_start": print("  [Turn Start]")
-        elif event.type == "message_start":
-            msg = event.payload["message"]
-            print(f"    [Message Start] Role: {getattr(msg, 'role', '?')}")
-        elif event.type == "message_update":
-            ev = event.payload.get("assistant_message_event")
-            if ev and ev.type == "text_delta":
-                print(f"      [Stream Delta] {ev.payload.get('delta')}")
-        elif event.type == "message_end":
-            msg = event.payload["message"]
-            if isinstance(msg, AssistantMessage):
-                text = "".join(c.text for c in msg.content if isinstance(c, TextContent))
-                calls = [c for c in msg.content if isinstance(c, ToolCall)]
-                if text: print(f"    [Assistant Text End] {text}")
-                if calls: print(f"    [Assistant requested {len(calls)} tool calls]")
-            elif isinstance(msg, ToolResultMessage):
-                print(f"    [Tool Result End] {msg.tool_name}: {msg.content[0].text}")
-        elif event.type == "tool_execution_start":
-            print(f"      [Tool Start] {event.payload['tool_name']}({event.payload['args']})")
-        elif event.type == "tool_execution_update":
-            print(f"      [Tool Update] {event.payload['partial_result'].content[0].text}")
-        elif event.type == "tool_execution_end":
-            print(f"      [Tool End] {event.payload['tool_name']} (Error: {event.payload['is_error']})")
-        elif event.type == "agent_end": print("[Agent End]")
+    print("\n=== pie.py simulate ===\n")
 
-    agent.subscribe(logger)
-    print("\n> User: Please echo 'Hello world' by calling the tool call_tool:echo")
-    await agent.prompt("Please echo 'Hello world' by calling the tool call_tool:echo")
-
-    print("\n--- Validation Error ---")
+    print("--- 1: Plain text exchange ---")
     try:
-        validate_tool_arguments(EchoTool(), ToolCall(id="x", name="echo", arguments={}))
-    except ValueError as e:
-        print(f"Caught expected error:\n{e}")
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[AssistantMessage(content=[TextContent("Hello!")], stop_reason="stop")],
+        )
+        agent = Agent(api, system="You are helpful.")
+        msg = await agent.run("Hi")
+        texts = [b.text for b in msg.content if isinstance(b, TextContent)]
+        assert texts == ["Hello!"], texts
+        assert msg.stop_reason == "stop"
+        assert len(agent.messages) == 2   
+        _ok("plain text response received and stored")
+    except Exception as exc:
+        _fail("plain text exchange", exc)
 
-    print("\n\n--- Part 2: Coding Tools ---")
+    print("\n--- 2: Single tool call round-trip ---")
+    try:
+        class EchoParams(BaseModel):
+            message: str
 
-    with tempfile.TemporaryDirectory() as tmp:
-        cwd = tmp
+        class EchoTool(Tool):
+            name = "Echo"
+            description = "Echo a message"
+            parameters = EchoParams
+            async def execute(self, params, signal=None):
+                return ToolResult(content=[TextContent(f"Echo: {params.message}")])
 
-        async def run(tool: AgentTool, **kwargs: Any) -> str:
-            params_model = tool.parameters(**kwargs)
-            result = await tool.execute("test-id", params_model)
-            return result.content[0].text
+        tool_call = ToolCall(id="tc1", name="Echo", arguments={"message": "ping"})
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[
+                AssistantMessage(content=[tool_call], stop_reason="tool_use"),
+                AssistantMessage(content=[TextContent("Done.")], stop_reason="stop"),
+            ],
+        )
+        agent = Agent(api, tools=[EchoTool()])
+        msg = await agent.run("call Echo with ping")
+        assert msg.stop_reason == "stop"
+        assert len(agent.messages) == 4, len(agent.messages)
+        tool_result = agent.messages[2]
+        assert isinstance(tool_result, ToolResultMessage)
+        assert tool_result.content[0].text == "Echo: ping"
+        _ok("tool called, result appended, loop continued to stop")
+    except Exception as exc:
+        _fail("single tool call round-trip", exc)
 
-        write = WriteTool(cwd)
-        read  = ReadTool(cwd)
-        edit  = EditTool(cwd)
-        bash  = BashTool(cwd)
-        grep  = GrepTool(cwd)
-        find  = FindTool(cwd)
-        ls    = LsTool(cwd)
+    print("\n--- 3: Multi-turn tool calls ---")
+    try:
+        class CountParams(BaseModel):
+            n: int
 
-        try:
-            out = await run(write, path="hello.py", content="print('hello')\nprint('world')\n")
-            assert "created" in out
-            _ok("write: create new file")
-        except Exception as e:
-            _fail("write: create new file", e)
+        calls_made = []
 
-        try:
-            out = await run(write, path="hello.py", content="print('hi')\n")
-            assert "overwrote" in out
-            _ok("write: overwrite existing file")
-        except Exception as e:
-            _fail("write: overwrite", e)
+        class CountTool(Tool):
+            name = "Count"
+            description = "Count"
+            parameters = CountParams
+            async def execute(self, params, signal=None):
+                calls_made.append(params.n)
+                return ToolResult(content=[TextContent(str(params.n))])
 
-        try:
-            out = await run(read, path="hello.py")
-            assert "print('hi')" in out
-            _ok("read: full file")
-        except Exception as e:
-            _fail("read: full file", e)
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[
+                AssistantMessage(content=[ToolCall("t1", "Count", {"n": 1})], stop_reason="tool_use"),
+                AssistantMessage(content=[ToolCall("t2", "Count", {"n": 2})], stop_reason="tool_use"),
+                AssistantMessage(content=[TextContent("counted")], stop_reason="stop"),
+            ],
+        )
+        agent = Agent(api, tools=[CountTool()])
+        msg = await agent.run("count twice")
+        assert msg.stop_reason == "stop"
+        assert calls_made == [1, 2], calls_made
+        _ok("multi-turn tool loop ran correctly")
+    except Exception as exc:
+        _fail("multi-turn tool calls", exc)
 
-        await run(write, path="lines.txt", content="\n".join(f"line{i}" for i in range(1, 21)) + "\n")
-        try:
-            out = await run(read, path="lines.txt", offset=5, limit=3)
-            assert "line5" in out and "line7" in out and "line8" not in out
-            _ok("read: offset + limit")
-        except Exception as e:
-            _fail("read: offset + limit", e)
+    print("\n--- 4: Unknown tool ---")
+    try:
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[
+                AssistantMessage(content=[ToolCall("t1", "nonexistent", {})], stop_reason="tool_use"),
+                AssistantMessage(content=[TextContent("ok")], stop_reason="stop"),
+            ],
+        )
+        agent = Agent(api)
+        msg = await agent.run("call nonexistent")
+        tool_result = next(m for m in agent.messages if isinstance(m, ToolResultMessage))
+        assert tool_result.is_error
+        assert "not found" in tool_result.content[0].text
+        _ok("unknown tool produces is_error=True result")
+    except Exception as exc:
+        _fail("unknown tool", exc)
 
-        try:
-            await run(read, path="no_such_file.py")
-            _fail("read: missing file", "no error raised")
-        except ValueError:
-            _ok("read: missing file raises ValueError")
+    print("\n--- 5: Thinking block ---")
+    try:
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[AssistantMessage(
+                content=[ThinkingContent("hmm..."), TextContent("answer")],
+                stop_reason="stop",
+            )],
+        )
+        events_seen = []
+        agent = Agent(api)
+        agent.subscribe(lambda e: events_seen.append(e.type))
+        await agent.run("think")
+        assert "thinking_delta" in events_seen
+        assert "text_delta" in events_seen
+        _ok("thinking and text events both emitted")
+    except Exception as exc:
+        _fail("thinking block", exc)
 
-        await run(write, path="src.py", content="def foo():\n    return 1\n\ndef bar():\n    return 2\n")
-        try:
-            out = await run(edit, path="src.py", old_text="return 1", new_text="return 42")
-            assert "edited" in out
-            content = await run(read, path="src.py")
-            assert "return 42" in content and "return 1" not in content
-            _ok("edit: replace unique string")
-        except Exception as e:
-            _fail("edit: replace unique string", e)
+    print("\n--- 6: Abort ---")
+    try:
+        class SlowParams(BaseModel):
+            pass
 
-        try:
-            await run(edit, path="src.py", old_text="NOSUCHSTRING", new_text="x")
-            _fail("edit: missing old_text", "no error raised")
-        except ValueError:
-            _ok("edit: missing old_text raises ValueError")
+        class SlowTool(Tool):
+            name = "slow"
+            description = "Slow tool"
+            parameters = SlowParams
+            async def execute(self, params, signal=None):
+                return ToolResult(content=[TextContent("done")])
 
-        await run(write, path="dup.py", content="x = 1\nx = 1\n")
-        try:
-            await run(edit, path="dup.py", old_text="x = 1", new_text="x = 2")
-            _fail("edit: duplicate old_text", "no error raised")
-        except ValueError:
-            _ok("edit: duplicate old_text raises ValueError")
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[
+                AssistantMessage(content=[ToolCall("t1", "slow", {})], stop_reason="tool_use"),
+                AssistantMessage(content=[TextContent("after abort")], stop_reason="stop"),
+            ],
+        )
+        agent = Agent(api, tools=[SlowTool()])
+        agent.abort()   
+        msg = await agent.run("go slow")
+        assert msg.stop_reason == "aborted", msg.stop_reason
+        _ok("abort signal stops loop after tool execution")
+    except Exception as exc:
+        _fail("abort", exc)
 
-        try:
-            out = await run(bash, command="echo pie_test_ok")
-            assert "pie_test_ok" in out
-            _ok("bash: echo command")
-        except Exception as e:
-            _fail("bash: echo command", e)
+    print("\n--- 7: Branch isolation ---")
+    try:
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[
+                AssistantMessage(content=[TextContent("parent")], stop_reason="stop"),
+                AssistantMessage(content=[TextContent("child")], stop_reason="stop"),
+            ],
+        )
+        agent = Agent(api)
+        await agent.run("parent prompt")
+        parent_len = len(agent.messages)
 
-        try:
-            out = await run(bash, command="exit 1")
-            assert "exit code 1" in out
-            _ok("bash: non-zero exit code captured")
-        except Exception as e:
-            _fail("bash: non-zero exit", e)
+        child = agent.branch()
+        await child.run("child prompt")
 
-        await run(write, path="a.py", content="def foo():\n    pass\ndef bar():\n    pass\n")
-        await run(write, path="b.py", content="class Foo:\n    def foo(self): pass\n")
-        try:
-            out = await run(grep, pattern="def foo")
-            assert "a.py" in out
-            _ok("grep: basic pattern across files")
-        except Exception as e:
-            _fail("grep: basic pattern", e)
+        assert len(agent.messages) == parent_len, "parent messages mutated by branch"
+        assert len(child.messages) > parent_len, "child has more messages"
+        _ok("branch messages diverge, parent unaffected")
+    except Exception as exc:
+        _fail("branch isolation", exc)
 
-        try:
-            out = await run(grep, pattern="class", glob="*.py")
-            assert "Foo" in out
-            _ok("grep: glob filter")
-        except Exception as e:
-            _fail("grep: glob filter", e)
+    print("\n--- 8: Parallel tool calls ---")
+    try:
+        start_times: list[float] = []
+        end_times: list[float] = []
 
-        try:
-            out = await run(grep, pattern="DEF FOO", ignore_case=True)
-            assert "foo" in out.lower()
-            _ok("grep: ignore_case")
-        except Exception as e:
-            _fail("grep: ignore_case", e)
+        class DelayParams(BaseModel):
+            ms: int
 
-        try:
-            out = await run(grep, pattern="def.foo", literal=True)
-            assert "No matches" in out
-            _ok("grep: literal (no regex)")
-        except Exception as e:
-            _fail("grep: literal", e)
+        class DelayTool(Tool):
+            name = "delay"
+            description = "Delay"
+            parameters = DelayParams
+            async def execute(self, params, signal=None):
+                start_times.append(time.time())
+                await asyncio.sleep(params.ms / 1000)
+                end_times.append(time.time())
+                return ToolResult(content=[TextContent("ok")])
 
-        try:
-            out = await run(grep, pattern="def foo", context=1)
-            assert "--" in out  
-            _ok("grep: context lines")
-        except Exception as e:
-            _fail("grep: context lines", e)
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[
+                AssistantMessage(content=[
+                    ToolCall("t1", "delay", {"ms": 100}),
+                    ToolCall("t2", "delay", {"ms": 100}),
+                ], stop_reason="tool_use"),
+                AssistantMessage(content=[TextContent("done")], stop_reason="stop"),
+            ],
+        )
+        agent = Agent(api, tools=[DelayTool()])
+        t0 = time.time()
+        await agent.run("run two delays")
+        elapsed = time.time() - t0
+        assert elapsed < 0.18, f"took {elapsed:.3f}s — likely sequential"
+        _ok(f"two 100ms tools ran in parallel ({elapsed*1000:.0f}ms)")
+    except Exception as exc:
+        _fail("parallel tool calls", exc)
 
-        os.makedirs(os.path.join(cwd, "sub"), exist_ok=True)
-        await run(write, path="sub/c.py", content="# sub\n")
-        try:
-            out = await run(find, pattern="*.py")
-            assert "a.py" in out and "sub/c.py" in out
-            _ok("find: glob pattern")
-        except Exception as e:
-            _fail("find: glob pattern", e)
+    print("\n--- 9: OpenAIChat mock ---")
+    try:
+        api = OpenAIChat(
+            model="gpt-4o", api_key="x",
+            mock=[AssistantMessage(content=[TextContent("hi from openai")], stop_reason="stop")],
+        )
+        agent = Agent(api)
+        msg = await agent.run("hello")
+        assert msg.content[0].text == "hi from openai"
+        _ok("OpenAIChat mock path works")
+    except Exception as exc:
+        _fail("OpenAIChat mock", exc)
 
-        try:
-            out = await run(find, pattern="*.txt")
-            assert "lines.txt" in out
-            _ok("find: txt files")
-        except Exception as e:
-            _fail("find: txt files", e)
+    print("\n--- 10: Tool argument validation ---")
+    try:
+        class StrictParams(BaseModel):
+            value: int
 
-        try:
-            out = await run(ls)
-            assert "a.py" in out or "hello.py" in out
-            _ok("ls: default cwd")
-        except Exception as e:
-            _fail("ls: default cwd", e)
+        class StrictTool(Tool):
+            name = "strict"
+            description = "Strict"
+            parameters = StrictParams
+            async def execute(self, params, signal=None):
+                return ToolResult(content=[TextContent(str(params.value))])
 
-        try:
-            out = await run(ls, path="sub")
-            assert "c.py" in out
-            _ok("ls: subdirectory")
-        except Exception as e:
-            _fail("ls: subdirectory", e)
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[
+                AssistantMessage(content=[ToolCall("t1", "strict", {"value": "not_an_int"})], stop_reason="tool_use"),
+                AssistantMessage(content=[TextContent("recovered")], stop_reason="stop"),
+            ],
+        )
+        agent = Agent(api, tools=[StrictTool()])
+        msg = await agent.run("call with bad args")
+        tool_result = next(m for m in agent.messages if isinstance(m, ToolResultMessage))
+        assert tool_result.is_error
+        assert msg.stop_reason == "stop"
+        _ok("invalid tool args produce is_error result, loop recovers")
+    except Exception as exc:
+        _fail("tool argument validation", exc)
 
-        try:
-            coding = create_coding_tools(cwd)
-            assert len(coding) == 4
-            assert {t.name for t in coding} == {"read", "write", "edit", "bash"}
-            _ok("create_coding_tools: 4 tools, correct names")
-        except Exception as e:
-            _fail("create_coding_tools", e)
+    print("\n--- 11: Subscribe / unsubscribe ---")
+    try:
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[
+                AssistantMessage(content=[TextContent("first")], stop_reason="stop"),
+                AssistantMessage(content=[TextContent("second")], stop_reason="stop"),
+            ],
+        )
+        agent = Agent(api)
+        seen: list[str] = []
+        unsub = agent.subscribe(lambda e: seen.append(e.type))
+        await agent.run("first")
+        unsub()
+        seen_after_unsub = len(seen)
+        await agent.run("second")
+        assert len(seen) == seen_after_unsub, "events received after unsubscribe"
+        _ok("unsubscribe stops event delivery")
+    except Exception as exc:
+        _fail("subscribe/unsubscribe", exc)
 
-        try:
-            ro = create_read_only_tools(cwd)
-            assert len(ro) == 4
-            assert {t.name for t in ro} == {"read", "grep", "find", "ls"}
-            _ok("create_read_only_tools: 4 tools, correct names")
-        except Exception as e:
-            _fail("create_read_only_tools", e)
+    print("\n--- 12: Mock exhaustion ---")
+    try:
+        api = AnthropicMessages(
+            model="claude-sonnet-4-20250514", api_key="x",
+            mock=[AssistantMessage(content=[TextContent("only one")], stop_reason="stop")],
+        )
+        agent = Agent(api)
+        await agent.run("first")
+        assert len(api._mock) == 0
+        _ok("mock deque exhausted after use")
+    except Exception as exc:
+        _fail("mock exhaustion", exc)
 
-        try:
-            all_t = create_all_tools(cwd)
-            assert len(all_t) == 7
-            _ok("create_all_tools: 7 tools")
-        except Exception as e:
-            _fail("create_all_tools", e)
+    print(f"\n=== simulate complete: {_PASS} passed, {_FAIL} failed ===")
+    if _FAIL:
+        sys.exit(1)
 
-    print("\n=== Simulation Complete ===")
+_REPL_HELP = """\
+Commands:
+  /help          — show this message
+  /clear         — clear conversation history
+  /history       — print message history
+  /tools         — list active tools
+  /branch        — spawn a branched sub-agent and run a one-shot prompt
+  /abort         — signal abort after next tool call
+  exit / quit    — end the session
+"""
 
 
-async def repl(base_url, api, system_prompt):
-    context = Context(model_id="local-mod", provider="local-pro", api=api, system_prompt=system_prompt)
-    agent = Agent(context)
-    agent.provider_options.base_url = base_url
-    agent.provider_options.api_key = "local-key"
-    agent.tools = [EchoTool()]
+async def _repl(
+    api: Any,
+    system: str = "You are a helpful assistant.",
+    cwd: str | None = None,
+) -> None:
+    agent = Agent(api, system=system, tools=all_tools(cwd))
+    loop = asyncio.get_running_loop()
 
-    async def on_event(event):
-        if event.type == "message_update":
-            provider_ev = event.payload.get("assistant_message_event")
-            if provider_ev and provider_ev.type == "text_delta":
-                print(provider_ev.payload.get("delta", ""), end="", flush=True)
+    async def on_event(event: AgentEvent) -> None:
+        if event.type == "text_delta":
+            print(event.payload.get("delta", ""), end="", flush=True)
+        elif event.type == "thinking_delta":
+            print(f"\033[2m{event.payload.get('delta', '')}\033[0m", end="", flush=True)
+        elif event.type == "tool_start":
+            print(f"\n\033[33m[{event.payload['name']}]\033[0m "
+                  f"{json.dumps(event.payload['args'])[:120]}", end="", flush=True)
+        elif event.type == "tool_end":
+            if event.payload.get("is_error"):
+                print(" \033[31m(error)\033[0m", end="", flush=True)
         elif event.type == "error":
-            print(f"\n[error] {event.payload}")
-        elif event.type == "tool_execution_start":
-            print(f"\n[executing {event.payload['tool_name']}...]", end="", flush=True)
+            err = event.payload.get("error")
+            print(f"\n\033[31m[error]\033[0m {getattr(err, 'error_message', str(err))}")
 
     agent.subscribe(on_event)
+    print("pie REPL  •  type /help for commands, Ctrl-C or 'exit' to quit.\n")
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = await loop.run_in_executor(None, lambda: input("You: ").strip())
         except (EOFError, KeyboardInterrupt):
-            print("\nBye!"); break
+            print("\nBye!")
+            break
 
-        if not user_input: continue
+        if not user_input:
+            continue
+
+        if user_input.startswith("/"):
+            cmd, _, arg = user_input.partition(" ")
+            cmd = cmd.lower()
+            if cmd == "/help":
+                print(_REPL_HELP)
+            elif cmd == "/clear":
+                agent.messages.clear()
+                print("[history cleared]")
+            elif cmd == "/history":
+                for i, m in enumerate(agent.messages):
+                    if isinstance(m, UserMessage):
+                        content = m.content if isinstance(m.content, str) else str(m.content)[:80]
+                        print(f"  {i:2d} [user] {content[:80]}")
+                    elif isinstance(m, AssistantMessage):
+                        text = "".join(b.text for b in m.content if isinstance(b, TextContent))
+                        print(f"  {i:2d} [assistant] {text[:80]}")
+                    elif isinstance(m, ToolResultMessage):
+                        text = m.content[0].text[:60] if m.content else ""
+                        print(f"  {i:2d} [tool:{m.tool_name}] {text}")
+            elif cmd == "/tools":
+                for t in agent.tools:
+                    print(f"  {t.name} — {t.description[:60]}")
+            elif cmd == "/branch":
+                prompt = arg.strip() or "Summarise what we have discussed."
+                print(f"[branching: '{prompt}']")
+                child = agent.branch()
+                result = await child.run(prompt)
+                texts = [b.text for b in result.content if isinstance(b, TextContent)]
+                print("\n[branch result]:", "".join(texts)[:300])
+            elif cmd == "/abort":
+                agent.abort()
+                print("[abort signalled]")
+            else:
+                print(f"Unknown command: {cmd}  (try /help)")
+            continue
+
         if user_input.lower() in {"exit", "quit"}:
-            print("Bye!"); break
+            print("Bye!")
+            break
 
         print("Assistant: ", end="", flush=True)
-        await agent.prompt(user_input)
-        print() 
+        await agent.run(user_input)
+        print()
 
 
-def run_repl(base_url="http://127.0.0.1:8000/v1", system_prompt="You are a helpful assistant.", api="anthropic-messages"):
-    asyncio.run(repl(base_url=base_url, system_prompt=system_prompt, api=api))
+def run_repl(
+    base_url: str = "https://api.anthropic.com/v1",
+    model: str = "claude-opus-4-6",
+    provider: Literal["anthropic", "openai"] = "anthropic",
+    system: str = "You are a helpful assistant.",
+    cwd: str | None = None,
+) -> None:
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENAI_API_KEY") or "local-key"
+    if provider == "anthropic":
+        api = AnthropicMessages(model=model, api_key=api_key, base_url=base_url)
+    else:
+        api = OpenAIChat(model=model, api_key=api_key, base_url=base_url)
+    asyncio.run(_repl(api, system=system, cwd=cwd))
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "simulate":
         asyncio.run(simulate())
-    else:
+    elif len(sys.argv) > 1 and sys.argv[1] == "repl":
         run_repl()
+    else:
+        print("Usage: python pie.py simulate | repl")
+        sys.exit(1)

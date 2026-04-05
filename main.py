@@ -125,6 +125,7 @@ def parse_tool(tools, names):
     return qwen_tools
 
 def encode(body, tokenizer, system, names, skips):
+    trace_logger.debug(body)
     msgs = []
     sys_parts = []
     if isinstance(system, str):
@@ -182,15 +183,20 @@ def encode(body, tokenizer, system, names, skips):
         if parts:
             msgs.append({"role": role}|parts)
     if not msgs[-1].get('content', '').strip():
-        return None, ''
+        return None, -1
     apply_chat_template = lambda x: tokenizer.apply_chat_template(x, tools = parse_tool(body.get("tools", []), names), tokenize=False, add_generation_prompt=True)
-    full = apply_chat_template(msgs)
+    full_s = apply_chat_template(msgs)
     last_user_idx = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=None)
     if last_user_idx is None:
-        return full, ''
+        return None, -1
     p_msgs = msgs[:last_user_idx] + [dict(role='user', content='h' if msgs[last_user_idx]['content'][0] != 'h' else 'i')]
-    pref = apply_chat_template(p_msgs)
-    return full, pref
+    prfx_s = apply_chat_template(p_msgs)
+    add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(tokenizer.bos_token)
+    full = tokenizer.encode(full_s, add_special_tokens=add_special_tokens)
+    prfx = tokenizer.encode(prfx_s, add_special_tokens=add_special_tokens)
+    save_at = get_common_len(full, prfx)
+    stream_logger.debug(f'{save_at}\n{dmca(tokenizer.decode(full[:save_at]))}\n---\n{dmca(tokenizer.decode(full[save_at:]))}')
+    return full, save_at
 
 def decode(raw_text, tokenizer, parse_think, single_think=False):
     def escape(text):
@@ -286,7 +292,10 @@ def dmca(p_str):
         p_str = re.sub(pattern, lambda m: mask_text(m.group(0)), p_str)
     return p_str
 
-def make_handler(model, tokenizer, system, names, skips, parse_think=True):
+def make_handler(model_name, system, names, skips, parse_think=True):
+    model, tokenizer = mlx_lm.load(model_name)
+    if not isinstance(tokenizer, mlx_lm.tokenizer_utils.TokenizerWrapper):
+        tokenizer = mlx_lm.tokenizer_utils.TokenizerWrapper(tokenizer)
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -316,9 +325,9 @@ def make_handler(model, tokenizer, system, names, skips, parse_think=True):
                 return
             n = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(n))
-            prompt, pref = encode(body, tokenizer, system, names, skips)
+            prompt, save_at = encode(body, tokenizer, system, names, skips)
             with gen_lock:
-                raw, in_tokens, out_tokens = generate(model, tokenizer, pref=pref, prompt=prompt, max_tokens=body.get("max_tokens", 8192))
+                raw, in_tokens, out_tokens = generate(model, tokenizer, prompt=prompt, save_at=save_at, max_tokens=body.get("max_tokens", 8192))
             blocks, stop_reason = decode(raw, tokenizer, parse_think=parse_think)
             msg_id = f"msg_{uuid.uuid4().hex}"
             sse = blocks_to_sse(blocks, msg_id, in_tokens, out_tokens, stop_reason)
@@ -349,14 +358,14 @@ def save_dict_cache(cache_path, metadata, prompt_cache):
 
 def main():
     parser = argparse.ArgumentParser()
-    # parser.add_argument("--harness", default=None)
-    parser.add_argument("--harness", default="claude")
+    parser.add_argument("--harness", default=None)
+    # parser.add_argument("--harness", default="claude")
     parser.add_argument("--model", default="mlx-community/Qwen3.5-4B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-2B-OptiQ-4bit")
     # parser.add_argument("--model", default="mlx-community/Qwen3.5-0.8B-MLX-bf16")
-    parser.add_argument("--system", type=str, default='')
+    # parser.add_argument("--system", type=str, default='')
     # parser.add_argument("--system", type=str, default='# Env\n{env}')
-    # parser.add_argument("--system", type=str, default=None)
+    parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--cache", type=str, default='cache')
     # parser.add_argument("--names", nargs="+", default=[])
     parser.add_argument("--names", nargs="+", default=['Read','Edit','Write','Grep','Glob','Bash','Agent','Skill'])
@@ -374,8 +383,7 @@ def main():
     Path(args.cache).mkdir(parents=True, exist_ok=True)
     global dict_cache
     dict_cache = dict(model_name=args.model, cache_dir = args.cache)
-    model, tokenizer = mlx_lm.load(args.model)
-    server = HTTPServer((args.host, args.port), make_handler(model, tokenizer, args.system, args.names, args.skips))
+    server = HTTPServer((args.host, args.port), make_handler(args.model, args.system, args.names, args.skips))
     if args.nocc:
         try:
             server.serve_forever()
@@ -537,23 +545,11 @@ def generate_step(
         y, logprobs = next_y, next_logprobs
         n += 1
 
-def generate(model, tokenizer, prompt, pref, hook=None, max_tokens=256, helper_max_tokens=64, **kwargs):
-    global dict_cache
+def generate(model, tokenizer, prompt, save_at, hook=None, max_tokens=256, helper_max_tokens=64, **kwargs):
     if prompt is None:
         return '', 0, 0
-    if not isinstance(tokenizer, mlx_lm.tokenizer_utils.TokenizerWrapper):
-        tokenizer = mlx_lm.tokenizer_utils.TokenizerWrapper(tokenizer)
+    global dict_cache
     detokenizer = tokenizer.detokenizer
-    if isinstance(prompt, str):
-        add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(tokenizer.bos_token)
-        prompt_s = prompt
-        prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-        _pref = tokenizer.encode(pref, add_special_tokens=add_special_tokens)
-        save_at = get_common_len(prompt, _pref)
-    else:
-        prompt_s = tokenizer.decode(prompt)
-        save_at = -1 # □ for now
-    stream_logger.debug(dmca(prompt_s))
     text = ''
     gens = []
     common_len = 0
@@ -626,7 +622,7 @@ def generate(model, tokenizer, prompt, pref, hook=None, max_tokens=256, helper_m
     detokenizer.finalize()
     text += detokenizer.last_segment
     dict_cache['hx'] = prompt+gens
-    trace_logger.debug(f'G {hx_len} {len(prompt)} {common_len} {trim_len} {len(gens)}\n=== TPS ===\n- Processed {len(prompt)} input tokens in {tic_inp-tic_non:.0f} seconds ({len(prompt)/(tic_inp-tic_non):.0f} tokens per second)\n- Generated {len(gens)} new tokens in {tic_out-tic_inp:.0f} seconds ({len(gens)/(tic_out-tic_inp):.0f} tokens per second)\n\n=== INP ===\n{dmca(prompt_s)}\n=== OUT ===\n{text}')
+    trace_logger.debug(f'G {hx_len} {len(prompt)} {common_len} {trim_len} {len(gens)}\n=== TPS ===\n- Processed {len(prompt)} input tokens in {tic_inp-tic_non:.0f} seconds ({len(prompt)/(tic_inp-tic_non):.0f} tokens per second)\n- Generated {len(gens)} new tokens in {tic_out-tic_inp:.0f} seconds ({len(gens)/(tic_out-tic_inp):.0f} tokens per second)\n\n=== INP ===\n{dmca(tokenizer.decode(prompt))}\n=== OUT ===\n{text}')
     return text, len(prompt), len(gens)
 
 if __name__ == "__main__":
