@@ -516,7 +516,7 @@ class DefaultChat:
                 if text_parts:
                     msg["content"] = "".join(b.text for b in text_parts)
                 if thinking_parts:
-                    msg["thinking"] = "".join(b.thinking for b in thinking_parts)
+                    msg["reasoning_content"] = "".join(b.thinking for b in thinking_parts)
                 if tool_calls:
                     msg["tool_calls"] = [
                         {"id": tc.id, "type": "function",
@@ -585,7 +585,7 @@ class DefaultChat:
             msg = AssistantMessage()
             try:
                 async with httpx.AsyncClient(timeout=120.0) as client:
-                    async with client.stream("POST", f"{self.base_url}/chat/completions", json=payload, headers=headers) as resp:
+                    async with client.stream("POST", f"{self.base_url}/v1/chat/completions", json=payload, headers=headers) as resp:
                         if resp.status_code >= 400:
                             body = await resp.aread()
                             raise RuntimeError(f"HTTP {resp.status_code}: {body.decode()}")
@@ -610,10 +610,10 @@ class DefaultChat:
                             delta = choice.get("delta", {})
                             finish_reason = choice.get("finish_reason") or finish_reason
 
-                            if delta.get("thinking"):
-                                text = delta["thinking"]
-                                _thinking_buf += text
-                                es.push(Event("thinking_delta", {"delta": text, "partial": msg}))
+                            reasoning = delta.get("reasoning_content") or delta.get("thinking")
+                            if reasoning:
+                                _thinking_buf += reasoning
+                                es.push(Event("thinking_delta", {"delta": reasoning, "partial": msg}))
 
                             if delta.get("content"):
                                 text = delta["content"]
@@ -1986,11 +1986,18 @@ async def _repl(
     agent = Agent(api, system=system, tools=available_tools)
     loop = asyncio.get_running_loop()
     _suppress = False
+    last_ev_type = ""
+    last_delta = ""
     async def on_event(event: AgentEvent) -> None:
         # logger.debug(event) # □
-        nonlocal _suppress, is_tty
+        nonlocal _suppress, is_tty, last_ev_type, last_delta
         if event.type == "text_delta":
             delta = event.payload.get("delta", "")
+
+            if last_ev_type and last_ev_type[:4] != event.type[:4] and last_delta and not last_delta[-1].isspace() and delta and not delta[0].isspace():
+                print()
+            last_delta = delta
+            last_ev_type = event.type
             if "<tool_call>" in delta:
                 before, _, _ = delta.partition("<tool_call>")
                 print(before.strip(), end="", flush=True)
@@ -2004,10 +2011,19 @@ async def _repl(
         elif is_tty:
             if event.type == "thinking_delta":
                 delta = event.payload.get("delta", "")
+                if last_ev_type and last_ev_type[:4] != event.type[:4] and last_delta and not last_delta[-1].isspace() and delta and not delta[0].isspace():
+                    print()
+                last_delta = delta
+                last_ev_type = event.type
                 if delta.strip():
                     print(f"\033[2m{delta}\033[0m", end="", flush=True)
             elif event.type == "tool_start":
-                print(f"\033[33m{event.payload['name']}:\033[0m {json.dumps(event.payload['args'])[:120]}\n", flush=True)
+                delta = f"\033[33m{event.payload['name']}:\033[0m {json.dumps(event.payload['args'])[:120]}\n"
+                if last_ev_type and last_ev_type[:4] != event.type[:4] and last_delta and not last_delta[-1].isspace() and delta and not delta[0].isspace():
+                    print()
+                last_delta = delta
+                last_ev_type = event.type
+                print(delta, flush=True)
             elif event.type == "tool_result":
                 msg = event.payload["message"]
                 raw = "\n".join(b.text for b in msg.content if isinstance(b, TextContent))
@@ -2015,10 +2031,10 @@ async def _repl(
                 # print(f"\n\n\033[36m{raw[:200]}\033[0m\n", end="", flush=True) # □
             elif event.type == "tool_end":
                 if event.payload.get("is_error"):
-                    print(" \033[31m(error)\033[0m", end="", flush=True)
+                    print(" \033[31m(error)\033[0m", flush=True)
             elif event.type == "error":
                 err = event.payload.get("error")
-                print(f"\n\033[31m[error]\033[0m {getattr(err, 'error_message', str(err))}")
+                print(f"\n\033[31m[error]\033[0m {getattr(err, 'error_message', str(err))}\n")
 
     agent.subscribe(on_event)
     if is_tty:
@@ -2037,6 +2053,8 @@ async def _repl(
         if not user_input:
             continue
 
+        last_delta = ""
+        last_ev_type = ""
         logger.info(user_input)
 
         if user_input.startswith("/"):
@@ -2108,7 +2126,7 @@ def run_repl(
     elif provider == "codex":
         api = CodexChat(model=model, api_key=os.environ.get("OPENAI_API_KEY") if api_key is None else api_key, base_url=f'{base_url}/v1' if base_url else "https://api.openai.com/v1")
     else:
-        api = DefaultChat(model=model, api_key="mp" if api_key is None else api_key, base_url=f'{base_url}/v1' if base_url else "https://api.openai.com/v1")
+        api = DefaultChat(model=model, api_key="mp" if api_key is None else api_key, base_url=base_url if base_url else "https://api.openai.com/v1")
     
     try:
         asyncio.run(_repl(api, system=system, cwd=cwd, tools=tools))
@@ -2132,7 +2150,7 @@ def main():
     if args.simulate:
         asyncio.run(simulate())
     elif args.deepseek:
-        run_repl(base_url="https://api.deepseek.com/anthropic", model="deepseek-v4-flash", provider="claude", api_key=os.environ.get('DEEPSEEK_API_KEY'))
+        run_repl(base_url="https://api.deepseek.com", model="deepseek-v4-flash", provider="default", api_key=os.environ.get('DEEPSEEK_API_KEY'))
     else:
         run_repl(
             model=args.model, 

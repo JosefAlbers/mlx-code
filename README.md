@@ -9,7 +9,7 @@ It features a multi-provider local server, a terminal-based chat REPL, and a ded
 ### Features
 
 *   **Local MLX Inference**: Powered by `mlx-lm` for optimized performance on Apple Silicon. Includes intelligent prompt caching.
-*   **Multi-Provider Compatibility**: Seamlessly translates and handles requests formatted for Claude, Gemini, Codex, and standard OpenAI APIs. 
+*   **Multi-Provider Compatibility**: Seamlessly translates and handles requests formatted for **Claude**, **Gemini**, **Codex**, **DeepSeek** and standard OpenAI APIs. 
 *   **Built-in REPL & Tools**: Comes with `pie`, a fully-featured chat REPL with tool execution and reasoning token support.
 *   **TUI Log Viewer**: Includes a Curses-based Terminal UI for filtering, inspecting, and tracking JSON logs in real-time.
 *   **Server Mode**: Easily spin up a local server compatible with standard LLM tooling.
@@ -44,8 +44,11 @@ mc --model mlx-community/Qwen3.5-4B-OptiQ-4bit
 # Use DeepSeek V4 Flash API
 me --deepseek
 
-# Run the server only on a custom port
-mc --nocc --port 8080
+# Run the server only
+mc --nocc
+
+# General shell piping and chaining works too
+echo "explain symgraph.py" | mc | cat - PLAN.md | mc
 ```
 *(For a full list of mc server arguments, run mc --help)*
 

@@ -335,7 +335,7 @@ def parse_default(body: dict) -> tuple[list[Tool], list[Message]]:
         for b in content:
             btype = b.get("type")
             if btype == "thinking":
-                thinking_parts.append(b.get("thinking") or b.get("text", ""))
+                thinking_parts.append(b.get("thinking") or b.get("reasoning_content") or b.get("text", ""))
             elif btype == "text":
                 text_parts.append(b.get("text", ""))
         return "\n".join(text_parts), "\n".join(thinking_parts)
@@ -355,7 +355,7 @@ def parse_default(body: dict) -> tuple[list[Tool], list[Message]]:
             messages.append(Message(
                 role="assistant",
                 content=text or None,
-                thinking=thinking or m.get("thinking") or None,
+                thinking=thinking or m.get("reasoning_content") or m.get("thinking") or None,
                 tool_calls=[
                     ToolCall(tc["id"], tc["function"]["name"], _safe_json(tc["function"]["arguments"]))
                     for tc in m["tool_calls"]
@@ -367,7 +367,7 @@ def parse_default(body: dict) -> tuple[list[Tool], list[Message]]:
             messages.append(Message(
                 role=role,
                 content=text or None,
-                thinking=thinking or m.get("thinking") or None,
+                thinking=thinking or m.get("reasoning_content") or m.get("thinking") or None,
             ))
 
     return tools, messages
@@ -1111,7 +1111,7 @@ class DefaultAdapter(BaseAdapter):
         if not text:
             return b""
         if state == "thinking":
-            return self.chunk({"thinking": text})
+            return self.chunk({"reasoning_content": text})
         return self.chunk({"content": text})
 
     def tool(self, tool):

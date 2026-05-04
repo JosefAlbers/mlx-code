@@ -6,7 +6,7 @@ setup(
     author_email="albersj66@gmail.com",
     author="J Joe",
     license="Apache-2.0",
-    version="0.0.3",
+    version="0.0.4",
     readme="README.md",
     description="Coding Agent for Mac",
     long_description=open("README.md").read(),
