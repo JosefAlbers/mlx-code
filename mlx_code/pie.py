@@ -1,10 +1,12 @@
 # Based on pi (https://github.com/badlogic/pi-mono) by Mario Zechner (MIT License)
 #
 # Copyright 2026 J Joe
+# Licensed under the Apache License, Version 2.0
 
 from __future__ import annotations
 
 import asyncio
+import argparse
 import fnmatch
 import json
 import os
@@ -1967,13 +1969,26 @@ async def _repl(
     api: Any,
     system: str = "You are a helpful assistant.",
     cwd: str | None = None,
+    tools: list[str] | None = None,
 ) -> None:
-    agent = Agent(api, system=system, tools=all_tools(cwd))
+    is_tty = sys.stdin.isatty()
+    available_tools = all_tools(cwd)
+    if tools:
+        requested_names = {name.lower() for name in tools}
+        available_tools = [
+            t for t in available_tools 
+            if t.name.lower() in requested_names
+        ]
+        found_names = {t.name.lower() for t in available_tools}
+        for req in requested_names:
+            if req not in found_names:
+                print(f"Warning: Tool '{req}' is not recognized.")
+    agent = Agent(api, system=system, tools=available_tools)
     loop = asyncio.get_running_loop()
     _suppress = False
-
     async def on_event(event: AgentEvent) -> None:
-        nonlocal _suppress
+        # logger.debug(event) # □
+        nonlocal _suppress, is_tty
         if event.type == "text_delta":
             delta = event.payload.get("delta", "")
             if "<tool_call>" in delta:
@@ -1986,33 +2001,38 @@ async def _repl(
                 _suppress = False
             elif not _suppress:
                 print(delta, end="", flush=True)
-        elif event.type == "thinking_delta":
-            delta = event.payload.get("delta", "")
-            if delta.strip():
-                print(f"\033[2m{delta}\033[0m", end="", flush=True)
-        elif event.type == "tool_start":
-            print(f"\033[33m{event.payload['name']}:\033[0m {json.dumps(event.payload['args'])[:120]}\n", flush=True)
-        elif event.type == "tool_result":
-            msg = event.payload["message"]
-            raw = "\n".join(b.text for b in msg.content if isinstance(b, TextContent))
-            logger.debug(raw)
-            # print(f"\n\n\033[36m{raw[:200]}\033[0m\n", end="", flush=True) # □
-        elif event.type == "tool_end":
-            if event.payload.get("is_error"):
-                print(" \033[31m(error)\033[0m", end="", flush=True)
-        elif event.type == "error":
-            err = event.payload.get("error")
-            print(f"\n\033[31m[error]\033[0m {getattr(err, 'error_message', str(err))}")
+        elif is_tty:
+            if event.type == "thinking_delta":
+                delta = event.payload.get("delta", "")
+                if delta.strip():
+                    print(f"\033[2m{delta}\033[0m", end="", flush=True)
+            elif event.type == "tool_start":
+                print(f"\033[33m{event.payload['name']}:\033[0m {json.dumps(event.payload['args'])[:120]}\n", flush=True)
+            elif event.type == "tool_result":
+                msg = event.payload["message"]
+                raw = "\n".join(b.text for b in msg.content if isinstance(b, TextContent))
+                logger.debug(raw)
+                # print(f"\n\n\033[36m{raw[:200]}\033[0m\n", end="", flush=True) # □
+            elif event.type == "tool_end":
+                if event.payload.get("is_error"):
+                    print(" \033[31m(error)\033[0m", end="", flush=True)
+            elif event.type == "error":
+                err = event.payload.get("error")
+                print(f"\n\033[31m[error]\033[0m {getattr(err, 'error_message', str(err))}")
 
     agent.subscribe(on_event)
-    print("pie REPL  •  type /help for commands, Ctrl-D or 'exit' to quit.\n")
+    if is_tty:
+        print("pie REPL  •  type /help for commands, Ctrl-D or 'exit' to quit.\n")
 
     while True:
-        try:
-            user_input = await loop.run_in_executor(None, lambda: read_input().strip())
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye!")
-            return
+        if is_tty:
+            try:
+                user_input = await loop.run_in_executor(None, lambda: read_input().strip())
+            except (EOFError, KeyboardInterrupt):
+                print("\nBye!")
+                return
+        else:
+            user_input = sys.stdin.read()
 
         if not user_input:
             continue
@@ -2055,46 +2075,73 @@ async def _repl(
                 print(f"Unknown command: {cmd}  (try /help)")
             continue
 
-        if user_input.lower() in {"exit", "quit"}:
-            print("Bye!")
-            break
+        if is_tty:  
+            if user_input.lower() in {"exit", "quit"}:
+                print("Bye!")
+                break
+            print("\033[34mπ\033[0m ", end="", flush=True)
 
-        print("\033[34mπ\033[0m ", end="", flush=True)
         await agent.run(user_input)
         print()
-
+        if not is_tty:
+            break
 
 def run_repl(
     base_url: str | None = None,
-    model: str = "claude-opus-4-6",
+    model: str = "default",
     provider: Literal["claude", "codex", "gemini", "default"] = "default",
     system: str = "You are a helpful assistant.",
     cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    tools: list[str] | None = None,
+    api_key: str = None,
 ) -> None:
-    api_key = (
-        os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("GEMINI_API_KEY")
-        or "local-key"
-    )
+    if env is not None:
+        os.environ.clear()
+        os.environ.update(env)
+    cwd = os.getcwd() if cwd is None else cwd
+
     if provider == "claude":
-        api = ClaudeChat(model=model, api_key=api_key, base_url=f'{base_url}/v1' if base_url else "https://api.anthropic.com/v1")
+        api = ClaudeChat(model=model, api_key=os.environ.get("ANTHROPIC_API_KEY") if api_key is None else api_key, base_url=f'{base_url}/v1' if base_url else "https://api.anthropic.com/v1")
     elif provider == "gemini":
-        api = GeminiChat(model=model, api_key=api_key, base_url=f'{base_url}/v1beta'  if base_url else "https://generativelanguage.googleapis.com/v1beta")
+        api = GeminiChat(model=model, api_key=os.environ.get("GEMINI_API_KEY") if api_key is None else api_key, base_url=f'{base_url}/v1beta' if base_url else "https://generativelanguage.googleapis.com/v1beta")
     elif provider == "codex":
-        api = CodexChat(model=model, api_key=api_key, base_url=f'{base_url}/v1' if base_url else "https://api.openai.com/v1")
+        api = CodexChat(model=model, api_key=os.environ.get("OPENAI_API_KEY") if api_key is None else api_key, base_url=f'{base_url}/v1' if base_url else "https://api.openai.com/v1")
     else:
-        api = DefaultChat(model=model, api_key=api_key, base_url=f'{base_url}/v1' if base_url else "https://api.openai.com/v1")
+        api = DefaultChat(model=model, api_key="mp" if api_key is None else api_key, base_url=f'{base_url}/v1' if base_url else "https://api.openai.com/v1")
+    
     try:
-        asyncio.run(_repl(api, system=system, cwd=cwd))
+        asyncio.run(_repl(api, system=system, cwd=cwd, tools=tools))
     except KeyboardInterrupt:
-        pass
+        print("\nExiting...")
+
+def main():
+    from .main import setup_logger
+    setup_logger(log_file='log.json', console=True)
+    parser = argparse.ArgumentParser(description="Pie REPL")
+    parser.add_argument("-d", "--deepseek", action="store_true", help="Try deepseek")
+    parser.add_argument("--model", type=str, default="default", help="Model name")
+    parser.add_argument("--provider", choices=["claude", "codex", "gemini", "default"], default="default", help="API Provider")
+    parser.add_argument("--url", type=str, default="http://127.0.0.1:8000", help="Base URL for the API")
+    parser.add_argument("--system", type=str, default="You are a helpful assistant.", help="System prompt")
+    parser.add_argument("--cwd", type=str, default=None, help="Current working directory")
+    parser.add_argument("--tools", nargs='+', help="List of tools to enable (e.g., Bash Read Ls). Defaults to all.")
+    parser.add_argument("--simulate", action="store_true", help="Run in simulation mode instead of REPL")
+    args = parser.parse_args()
+
+    if args.simulate:
+        asyncio.run(simulate())
+    elif args.deepseek:
+        run_repl(base_url="https://api.deepseek.com/anthropic", model="deepseek-v4-flash", provider="claude", api_key=os.environ.get('DEEPSEEK_API_KEY'))
+    else:
+        run_repl(
+            model=args.model, 
+            provider=args.provider, 
+            base_url=args.url, 
+            system=args.system, 
+            cwd=args.cwd,
+            tools=args.tools,
+        )
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "simulate":
-        asyncio.run(simulate())
-    elif len(sys.argv) > 1 and sys.argv[1] == "repl":
-        run_repl(model=model, provider=prov, base_url=url)
-    else:
-        print("Usage: python pie.py simulate | repl [model] [provider] [base_url]")
-        sys.exit(1)
+    main()

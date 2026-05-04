@@ -1,5 +1,6 @@
 # Copyright 2026 J Joe
 
+import re
 import curses
 import json
 import sys
@@ -401,13 +402,14 @@ def render_list(win, entries: list[dict], cursor: int, scroll: int,
         f_name = short_file(entry.get("file", ""))
         fn     = entry.get("function", "")
         msg    = entry.get("message", "").replace("\n", " ")
+        lsg    = re.sub(r'\s{2,}', ' ', msg)
 
         line = (
             f"{ts:<{ts_w}}  "
             f"{level:<{lvl_w}}  "
             f"{f_name:<{file_w}}  "
             f"{fn:<{fn_w}}  "
-            f"{truncate(msg, msg_w)}"
+            f"{truncate(lsg, msg_w)}"
         )
         line = truncate(line, w - 4)
 

@@ -1,8 +1,9 @@
 # Copyright 2026 J Joe
 
 # {{{utl
+
 import json, uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 import random
@@ -141,6 +142,20 @@ def _copy_msg(m: Message) -> Message:
         tool_calls=list(m.tool_calls),
         tool_result=m.tool_result,
     )
+
+def _skip(text, skips=None, show_skipped=False):
+    if text is None or skips is None:
+        return text
+    lines = []
+    for pattern in skips:
+        found = re.findall(pattern, text)
+        if found:
+            lines.append(f"{pattern}\n" + "\n".join(found))
+    if lines and show_skipped:
+        logger.debug('\n---\n'.join(lines))
+    for pattern in skips:
+        text = re.sub(pattern, "", text)
+    return text
 
 def normalize(
     tools: list[Tool],
@@ -633,42 +648,32 @@ def translate(
     src: str,
     dst: str,
     *,
+    system_override: str | None = None,
     tool_names: list[str] | None = None,
+    skips: list[str] | None = None,
     strict: bool = False,
     **kwargs,
 ) -> Any:
     tools, messages = PARSERS[src](body)
-
     if tool_names is not None:
         missing = set(tool_names) - {t.name for t in tools}
         if missing and strict:
             raise ValueError(f"tool_names requested but not in body: {missing}")
         tools = [t for t in tools if t.name in tool_names]
-
+    if system_override is not None:
+        messages = [replace(m, content=system_override) if m.role == "system" else m for m in messages]
+    logger.debug(f'{messages=}\n\n{tools=}')
+    if skips is not None:
+        messages = [replace(m, content=_skip(m.content, skips)) for m in messages]
     tools, messages = normalize(tools, messages, strict=strict)
-
     return RENDERERS[dst](tools, messages)
 
 def encode(body, api, tokenizer, system_override, tool_names, skips, strict=False):
-    body = translate(body, api, "default", tool_names=tool_names, strict=strict)
+    body = translate(body, api, "default", system_override=system_override, tool_names=tool_names, skips=skips, strict=strict)
     tools = body.pop("tools", None)
-    msgs = body['messages']
-    if system_override is not None:
-        msgs = [m|dict(content=system_override) if m['role'] == 'system' else m for m in msgs]
-    def skip(text, show_skipped=False):
-        if skips is None:
-            return text
-        lines = []
-        for pattern in skips:
-            found = re.findall(pattern, text)
-            if found:
-                lines.append(f"{pattern}\n" + "\n".join(found))
-        if lines and show_skipped:
-            logger.debug('\n---\n'.join(lines))
-        for pattern in skips:
-            text = re.sub(pattern, "", text)
-        return text
-    logger.debug(f'msgs\n{json.dumps(msgs, indent=2)}')
+    msgs = body.pop('messages', None)
+    if not msgs or not msgs[-1].get('content', '').strip():
+        return '', None
     apply_chat_template = lambda x: tokenizer.apply_chat_template(x, tools = tools or None, tokenize=False, add_generation_prompt=True)
     full_s = apply_chat_template(msgs)
     add_special_tokens = tokenizer.bos_token is None or not full_s.startswith(tokenizer.bos_token)
@@ -717,7 +722,7 @@ class PromptCache:
         logger.info(f'{ckpts=} {len(prompt)=} {len(self.hx)=} {cl=}')
         if self.cache is not None:
             if len(self.hx)==cl:
-                logger.debug('reuse')
+                logger.debug('cont')
                 return cl
             if all(c.is_trimmable() for c in self.cache):
                 logger.debug(f'trim {len(self.hx)-cl}')
@@ -726,10 +731,9 @@ class PromptCache:
                 return cl
         for ckpt in ckpts:
             if self.get_path(prompt[:ckpt]).exists():
-                logger.debug(f'load {ckpt=}')
                 self.load(prompt[:ckpt])
                 return ckpt
-        logger.debug('fallback')
+        logger.debug('anew')
         self.cache = mlx_lm.models.cache.make_prompt_cache(self.model)
         self.hx = []
         return 0
@@ -741,6 +745,7 @@ class PromptCache:
 
     def load(self, prompt):
         path = self.get_path(prompt)
+        logger.debug(path)
         self.cache, metadata = mlx_lm.models.cache.load_prompt_cache(path, return_metadata=True)
         self.hx = json.loads(metadata.pop("hx", "[]"))
         mx.eval(self.cache)
@@ -748,6 +753,7 @@ class PromptCache:
     def save(self, hx, cache, ppt=None):
         if ppt is None or ppt == len(hx) - len(self.hx):
             path = self.get_path(hx)
+            logger.debug(path)
             metadata = dict(model_name=self.model_name, hx=json.dumps(hx))
             mlx_lm.models.cache.save_prompt_cache(path, cache, metadata=metadata)
             return 0
@@ -755,8 +761,8 @@ class PromptCache:
 
 
 def generate(model, tokenizer, prompt, ckpts, pc, max_tokens=256, **kwargs):
-    if prompt is None:
-        return
+    if ckpts is None:
+        return 
     _eos_token_ids = set(tokenizer.eos_token_ids)
     _eos_token_ids.add(tokenizer.eos_token_id)
 
@@ -930,7 +936,6 @@ def _parse_tools_xml(part):
     tool_pattern = re.compile(r'<tool_call>(.*?)</tool_call>', re.DOTALL)
     for match in tool_pattern.finditer(part):
         content = match.group(1).strip()
-        # if not ("<function=" in content and "<parameter=" in content and "</parameter>" in content):
         if not "<function=" in content:
             continue
         fn_match = re.search(r"<function=([^\s>]+)>", content)
@@ -1451,11 +1456,12 @@ def main():
     parser.add_argument("-a", "--api", type=str, default="default")
     parser.add_argument("-H", "--harness", default=None)
     parser.add_argument("-s", "--system", type=str, default='You are a helpful assistant')
-    parser.add_argument("--tools", nargs="+", default=None)
+    # parser.add_argument("--tools", nargs="+", default=['Bash', 'run_shell_command', 'exec_command'])
+    parser.add_argument("--tools", nargs="+", default=None, help="Allow all tools if None (default None)")
     parser.add_argument("--cache", type=str, default='cache')
     parser.add_argument("--work", default=os.getcwd())
     parser.add_argument("--nocc", action="store_true", help="Disable Claude Code subprocess and run server only")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=None, help="8000 if None (default None)")
     parser.add_argument("--skips", nargs="+", default=[
         r'(?m)^\[SUGGESTION MODE[\s\S]*',
         r'(?m)^<system-reminder>[\s\S]*?^</system-reminder>\s*',
@@ -1464,11 +1470,25 @@ def main():
     args, harness_args = parser.parse_known_args()
     logger.info(f'{args=} {harness_args=}')
     api = args.harness if args.harness else args.api
-    server = HTTPServer(
-        (args.host, args.port),
-        make_handler(args.model, api, args.cache, args.system, args.tools, args.skips),
-    )
+    port = args.port if args.port is not None else 8000
+    server = None
+    while server is None:
+        try:
+            server = HTTPServer(
+                (args.host, port),
+                make_handler(args.model, api, args.cache, args.system, args.tools, args.skips),
+            )
+        except OSError as e:
+            if e.errno == 48 or e.errno == 98: 
+                if args.port is not None:
+                    logger.error(f"Port {port} is already in use.")
+                    sys.exit(1)
+                port += 1
+            else:
+                raise e
+    url = f"http://{args.host}:{port}"
     if args.nocc:
+        print(url)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -1480,19 +1500,18 @@ def main():
 
         with tempfile.TemporaryDirectory() as _home:
             home = Path(_home)
-            env["HOME"] = _home
-            env["GOOGLE_GEMINI_BASE_URL"]=f"http://{args.host}:{args.port}"
+            env["HOME"] = str(home)
+            env["SHELL"] = "/bin/bash"
+            env["GOOGLE_GEMINI_BASE_URL"]=url
             env["GEMINI_API_KEY"]="mc"
 
             env.pop("OPENAI_API_KEY", None)
             codex_dir = home/".codex"
-            os.makedirs(codex_dir, exist_ok=True)
-            config_path = codex_dir/"config.toml"
-            with open(config_path, "w") as f:
-                f.write(f"""
+            codex_dir.mkdir(parents=True, exist_ok=True)
+            config_path = (codex_dir/"config.toml").write_text(f"""
 [model_providers.local]
 name = "openai"
-base_url = "http://{args.host}:{args.port}/v1"
+base_url = "{url}/v1"
 api_key = "mc"
 
 [profiles.local]
@@ -1500,7 +1519,7 @@ model_provider = "local"
 model = "gpt-5.4-mini"
 """.strip())
 
-            env["ANTHROPIC_BASE_URL"] = f"http://{args.host}:{args.port}"
+            env["ANTHROPIC_BASE_URL"] = url
             env["ANTHROPIC_AUTH_TOKEN"] = "mc"
             env["ANTHROPIC_MODEL"] = args.model
             def mirror_workspace(src: str, dst: str):
@@ -1513,7 +1532,7 @@ model = "gpt-5.4-mini"
             mirror_workspace(args.work, workspace)
             if args.harness is None:
                 from .pie import run_repl
-                run_repl(base_url=f"http://{args.host}:{args.port}", provider=api)
+                run_repl(base_url=url, provider=api, cwd=str(workspace), env=env)
             else:
                 if args.harness == "codex":
                     harness_args += ['--profile', 'local']
@@ -1522,4 +1541,3 @@ model = "gpt-5.4-mini"
 if __name__ == "__main__":
     main()
 # }}}ser
-
