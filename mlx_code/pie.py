@@ -194,19 +194,19 @@ _REASONING_BUDGET: dict[str, int] = {
 class ClaudeChat:
     def __init__(
         self,
-        model: str,
-        api_key: str,
         *,
-        base_url: str = "https://api.anthropic.com/v1",
+        model: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
         max_tokens: int = 8_192,
         temperature: float | None = None,
         reasoning: Literal["off", "minimal", "low", "medium", "high", "xhigh"] = "off",
         tool_choice: Any = None,
         mock: list[AssistantMessage] | None = None,
     ) -> None:
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.model = "claude-haiku-4-5" if model is None else model
+        self.api_key = os.environ.get("ANTHROPIC_API_KEY", "jj") if api_key is None else api_key
+        self.base_url = "https://api.anthropic.com/v1" if base_url is None else base_url.rstrip("/")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.reasoning = reasoning
@@ -454,18 +454,18 @@ class ClaudeChat:
 class DefaultChat:
     def __init__(
         self,
-        model: str,
-        api_key: str,
         *,
-        base_url: str = "https://api.openai.com/v1",
+        model: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
         max_tokens: int = 8_192,
         temperature: float | None = None,
         tool_choice: Any = None,
         mock: list[AssistantMessage] | None = None,
     ) -> None:
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.model = "jj" if model is None else model
+        self.api_key = os.environ.get('DEEPSEEK_API_KEY', "jj") if api_key is None else api_key
+        self.base_url = "http://127.0.0.1:8000" if base_url is None else f'{base_url.rstrip("/")}/v1/chat/completions'
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.tool_choice = tool_choice
@@ -585,7 +585,7 @@ class DefaultChat:
             msg = AssistantMessage()
             try:
                 async with httpx.AsyncClient(timeout=120.0) as client:
-                    async with client.stream("POST", f"{self.base_url}/v1/chat/completions", json=payload, headers=headers) as resp:
+                    async with client.stream("POST", self.base_url, json=payload, headers=headers) as resp:
                         if resp.status_code >= 400:
                             body = await resp.aread()
                             raise RuntimeError(f"HTTP {resp.status_code}: {body.decode()}")
@@ -678,9 +678,9 @@ class DefaultChat:
 class GeminiChat:
     def __init__(
         self,
-        model: str,
-        api_key: str,
         *,
+        model: str | None = None,
+        api_key: str | None = None,
         base_url: str = "https://generativelanguage.googleapis.com/v1beta",
         max_tokens: int = 8_192,
         temperature: float | None = None,
@@ -689,9 +689,9 @@ class GeminiChat:
         tool_choice: Any = None, 
         mock: list[AssistantMessage] | None = None,
     ) -> None:
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.model = "gemini-3.1-flash-lite-preview" if model is None else model
+        self.api_key = os.environ.get("GEMINI_API_KEY", "jj") if api_key is None else api_key
+        self.base_url = "https://generativelanguage.googleapis.com/v1beta" if base_url is None else base_url.rstrip("/")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.thinking = thinking
@@ -916,18 +916,18 @@ class GeminiChat:
 class CodexChat:
     def __init__(
         self,
-        model: str,
-        api_key: str,
         *,
-        base_url: str = "https://api.openai.com/v1",
+        model: str | None = None,
+        api_key: str | None = None,
+        base_url: str | None = None,
         max_tokens: int = 8_192,
         temperature: float | None = None,
         tool_choice: Any = None,
         mock: list[AssistantMessage] | None = None,
     ) -> None:
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self.model = "gpt-5.4-mini" if model is None else model
+        self.api_key = os.environ.get("OPENAI_API_KEY", "jj") if api_key is None else api_key
+        self.base_url = "https://api.openai.com/v1/chat/responses" if base_url is None else base_url.rstrip("/")
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.tool_choice = tool_choice
@@ -1045,7 +1045,7 @@ class CodexChat:
             try:
                 async with httpx.AsyncClient(timeout=120.0) as client:
                     async with client.stream(
-                        "POST", f"{self.base_url}/responses",
+                        "POST", self.base_url,
                         json=payload, headers=headers
                     ) as resp:
                         if resp.status_code >= 400:
@@ -1437,7 +1437,7 @@ class BashTool(Tool):
             raise ValueError(f"Command timed out after {params.timeout}s")
         output = stdout.decode(errors="replace")
         exit_code = proc.returncode or 0
-        result = f"$ {params.command}\n{output}"
+        result = str(output) + ' '
         if exit_code != 0:
             result += f"\n[exit code {exit_code}]"
         return ToolResult(content=[TextContent(_truncate(result, params.command))])
@@ -1584,6 +1584,70 @@ class LsTool(Tool):
         return ToolResult(content=[TextContent("\n".join(entries) if entries else "(empty)")])
 
 
+class ReadASTParams(BaseModel):
+    path: str = Field(description="File or directory to inspect (relative to cwd)")
+    symbols: list[str] = Field(
+        default_factory=list,
+        description=(
+            "List of symbol names to look up, e.g. [\"MyClass\", \"my_fn\"]. "
+            "Omit (or pass []) for outline mode."
+        ),
+    )
+    depth: int = Field(
+        default=1,
+        description=(
+            "Outline mode: nesting levels (1=top-level only, 2=+methods). "
+            "Symbol mode: alias-expansion hops (0=exact names only, default 1)."
+        ),
+    )
+
+    @classmethod
+    def model_validate(cls, obj, **kw):
+        if isinstance(obj, dict) and isinstance(obj.get("symbols"), str):
+            raw = obj["symbols"].strip()
+            try:
+                parsed = json.loads(raw)
+                obj = {**obj, "symbols": parsed if isinstance(parsed, list) else [parsed]}
+            except (json.JSONDecodeError, ValueError):
+                obj = {**obj, "symbols": [raw] if raw else []}
+        return super().model_validate(obj, **kw)
+
+class ReadASTTool(Tool):
+    name = "ReadAST"
+    description = (
+        "Inspect Python source by AST analysis. Two modes:\n"
+        "  OUTLINE (no symbols): returns the symbol tree of a file or directory — "
+        "class/function/method/var names with line ranges. Use this first to "
+        "orient yourself before reading or editing code.\n"
+        "  SYMBOL LOOKUP (symbols=[\"Name\", ...]): returns the definition and every "
+        "reference to those names as raw source snippets. Use this to read specific "
+        "functions or classes. The output is paste-safe for use as old_str in an "
+        "Edit call."
+    )
+    parameters = ReadASTParams
+
+    def __init__(self, cwd: str | None = None) -> None:
+        self.cwd = cwd or os.getcwd()
+
+    async def execute(self, params: ReadASTParams, signal=None) -> ToolResult:
+        from .symgraph import format_outline, analyze_multi, format_results #.
+
+        target = _resolve(params.path, self.cwd)
+
+        if not params.symbols:
+            text = format_outline(target, depth=params.depth)
+            return ToolResult(content=[TextContent(text)])
+
+        results = analyze_multi(target, params.symbols, depth=params.depth)
+        if not results.definitions and not results.uses:
+            return ToolResult(
+                content=[TextContent(f"No definitions or uses found for: {params.symbols}")],
+                is_error=True,
+            )
+        text = format_results(results, show_defs=True, raw=True)
+        return ToolResult(content=[TextContent(text)])
+
+
 def coding_tools(cwd: str | None = None) -> list[Tool]:
     return [ReadTool(cwd), WriteTool(cwd), EditTool(cwd), BashTool(cwd)]
 
@@ -1592,7 +1656,7 @@ def readonly_tools(cwd: str | None = None) -> list[Tool]:
 
 def all_tools(cwd: str | None = None) -> list[Tool]:
     return [ReadTool(cwd), WriteTool(cwd), EditTool(cwd), BashTool(cwd),
-            GrepTool(cwd), FindTool(cwd), LsTool(cwd)]
+            GrepTool(cwd), FindTool(cwd), LsTool(cwd), ReadASTTool(cwd)]
 
 _PASS = 0
 _FAIL = 0
@@ -1973,7 +2037,7 @@ async def _repl(
 ) -> None:
     is_tty = sys.stdin.isatty()
     available_tools = all_tools(cwd)
-    if tools:
+    if tools is not None:
         requested_names = {name.lower() for name in tools}
         available_tools = [
             t for t in available_tools 
@@ -1994,41 +2058,42 @@ async def _repl(
         if event.type == "text_delta":
             delta = event.payload.get("delta", "")
 
-            if last_ev_type and last_ev_type[:4] != event.type[:4] and last_delta and not last_delta[-1].isspace() and delta and not delta[0].isspace():
+
+            if "<tool_call>" in delta:
+                before, _, delta = delta.partition("<tool_call>")
+                print(before.strip(), end="", flush=True)
+                _suppress = True
+            if "</tool_call>" in delta:
+                _, _, delta = delta.partition("<tool_call>")
+                _suppress = False
+            if not last_delta:
+                delta = delta.lstrip()
+            if last_ev_type and last_ev_type[:4] != event.type[:4] and last_delta and not last_delta[-1].isspace() and delta and not delta[0].isspace() and delta.strip():
                 print()
             last_delta = delta
             last_ev_type = event.type
-            if "<tool_call>" in delta:
-                before, _, _ = delta.partition("<tool_call>")
-                print(before.strip(), end="", flush=True)
-                _suppress = True
-            elif "</tool_call>" in delta:
-                _, _, after = delta.partition("<tool_call>")
-                print(after.strip(), end="", flush=True)
-                _suppress = False
-            elif not _suppress:
+            if not _suppress:
                 print(delta, end="", flush=True)
         elif is_tty:
             if event.type == "thinking_delta":
                 delta = event.payload.get("delta", "")
-                if last_ev_type and last_ev_type[:4] != event.type[:4] and last_delta and not last_delta[-1].isspace() and delta and not delta[0].isspace():
+                if not last_delta:
+                    delta = delta.lstrip()
+                if last_ev_type and last_ev_type[:4] != event.type[:4] and last_delta and not last_delta[-1].isspace() and delta and not delta[0].isspace() and delta.strip():
                     print()
                 last_delta = delta
                 last_ev_type = event.type
-                if delta.strip():
-                    print(f"\033[2m{delta}\033[0m", end="", flush=True)
+                print(f"\033[2m{delta.rstrip('\n')}\033[0m", end="", flush=True)
             elif event.type == "tool_start":
-                delta = f"\033[33m{event.payload['name']}:\033[0m {json.dumps(event.payload['args'])[:120]}\n"
-                if last_ev_type and last_ev_type[:4] != event.type[:4] and last_delta and not last_delta[-1].isspace() and delta and not delta[0].isspace():
-                    print()
+                delta = f"{event.payload['name']} {json.dumps(event.payload['args'])[:120]} "
                 last_delta = delta
                 last_ev_type = event.type
-                print(delta, flush=True)
+                print(f"\033[33m{delta}\033[0m", end="", flush=True)
             elif event.type == "tool_result":
                 msg = event.payload["message"]
-                raw = "\n".join(b.text for b in msg.content if isinstance(b, TextContent))
-                logger.debug(raw)
-                # print(f"\n\n\033[36m{raw[:200]}\033[0m\n", end="", flush=True) # □
+                delta = "\n".join(b.text for b in msg.content if isinstance(b, TextContent))
+                logger.debug(delta)
+                # print(f"\n\n\033[36m{delta}\033[0m\n", end="", flush=True) # □
             elif event.type == "tool_end":
                 if event.payload.get("is_error"):
                     print(" \033[31m(error)\033[0m", flush=True)
@@ -2106,7 +2171,7 @@ async def _repl(
 
 def run_repl(
     base_url: str | None = None,
-    model: str = "default",
+    model: str | None = None,
     provider: Literal["claude", "codex", "gemini", "default"] = "default",
     system: str = "You are a helpful assistant.",
     cwd: str | None = None,
@@ -2120,25 +2185,24 @@ def run_repl(
     cwd = os.getcwd() if cwd is None else cwd
 
     if provider == "claude":
-        api = ClaudeChat(model=model, api_key=os.environ.get("ANTHROPIC_API_KEY") if api_key is None else api_key, base_url=f'{base_url}/v1' if base_url else "https://api.anthropic.com/v1")
+        api = ClaudeChat(model=model, api_key=api_key, base_url=base_url)
     elif provider == "gemini":
-        api = GeminiChat(model=model, api_key=os.environ.get("GEMINI_API_KEY") if api_key is None else api_key, base_url=f'{base_url}/v1beta' if base_url else "https://generativelanguage.googleapis.com/v1beta")
+        api = GeminiChat(model=model, api_key=api_key, base_url=base_url)
     elif provider == "codex":
-        api = CodexChat(model=model, api_key=os.environ.get("OPENAI_API_KEY") if api_key is None else api_key, base_url=f'{base_url}/v1' if base_url else "https://api.openai.com/v1")
+        api = CodexChat(model=model, api_key=api_key, base_url=base_url)
     else:
-        api = DefaultChat(model=model, api_key="mp" if api_key is None else api_key, base_url=base_url if base_url else "https://api.openai.com/v1")
-    
+        api = DefaultChat(model=model, api_key=api_key, base_url=base_url)
     try:
         asyncio.run(_repl(api, system=system, cwd=cwd, tools=tools))
     except KeyboardInterrupt:
         print("\nExiting...")
 
 def main():
-    from .main import setup_logger
+    from .main import setup_logger #.
     setup_logger(log_file='log.json', console=True)
     parser = argparse.ArgumentParser(description="Pie REPL")
-    parser.add_argument("-d", "--deepseek", action="store_true", help="Try deepseek")
-    parser.add_argument("--model", type=str, default="default", help="Model name")
+    parser.add_argument("-d", "--deepseek", action="store_true", help="Shortcut for --url https://api.deepseek.com --model deepseek-v4-flash")
+    parser.add_argument("--model", type=str, default=None, help="Model name")
     parser.add_argument("--provider", choices=["claude", "codex", "gemini", "default"], default="default", help="API Provider")
     parser.add_argument("--url", type=str, default="http://127.0.0.1:8000", help="Base URL for the API")
     parser.add_argument("--system", type=str, default="You are a helpful assistant.", help="System prompt")
@@ -2147,18 +2211,23 @@ def main():
     parser.add_argument("--simulate", action="store_true", help="Run in simulation mode instead of REPL")
     args = parser.parse_args()
 
+    url = args.url
+    model = args.model
+    tools = args.tools
+    if args.deepseek:
+        url = "https://api.deepseek.com"
+        model = "deepseek-v4-flash"
+        # tools = [] # □
     if args.simulate:
         asyncio.run(simulate())
-    elif args.deepseek:
-        run_repl(base_url="https://api.deepseek.com", model="deepseek-v4-flash", provider="default", api_key=os.environ.get('DEEPSEEK_API_KEY'))
     else:
         run_repl(
-            model=args.model, 
             provider=args.provider, 
-            base_url=args.url, 
             system=args.system, 
             cwd=args.cwd,
-            tools=args.tools,
+            model=model, 
+            base_url=url, 
+            tools=tools,
         )
 
 if __name__ == "__main__":

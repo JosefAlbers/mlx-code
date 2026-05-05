@@ -1,7 +1,6 @@
 # Copyright 2026 J Joe
 
 # {{{utl
-
 import json, uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
@@ -42,6 +41,7 @@ import json
 from datetime import datetime, timezone
 
 _LOG_RECORD_BUILTIN_KEYS = frozenset(logging.LogRecord("", 0, "", 0, "", (), None).__dict__)
+request_id_var = uuid.uuid4()
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -53,6 +53,7 @@ class JsonFormatter(logging.Formatter):
             "file": record.pathname,
             "function": record.funcName,
             "line": record.lineno,
+            "request_id": request_id_var, 
         }
 
         extras = {
@@ -748,7 +749,7 @@ class PromptCache:
         logger.debug(path)
         self.cache, metadata = mlx_lm.models.cache.load_prompt_cache(path, return_metadata=True)
         self.hx = json.loads(metadata.pop("hx", "[]"))
-        mx.eval(self.cache)
+        mx.async_eval(self.cache)
 
     def save(self, hx, cache, ppt=None):
         if ppt is None or ppt == len(hx) - len(self.hx):
@@ -758,7 +759,6 @@ class PromptCache:
             mlx_lm.models.cache.save_prompt_cache(path, cache, metadata=metadata)
             return 0
         return len(hx)-ppt
-
 
 def generate(model, tokenizer, prompt, ckpts, pc, max_tokens=256, **kwargs):
     if ckpts is None:
@@ -1531,7 +1531,7 @@ model = "gpt-5.4-mini"
             workspace = home/"workspace"
             mirror_workspace(args.work, workspace)
             if args.harness is None:
-                from .pie import run_repl
+                from .pie import run_repl #.
                 run_repl(base_url=url, provider=api, cwd=str(workspace), env=env)
             else:
                 if args.harness == "codex":

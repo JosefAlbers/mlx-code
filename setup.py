@@ -6,7 +6,7 @@ setup(
     author_email="albersj66@gmail.com",
     author="J Joe",
     license="Apache-2.0",
-    version="0.0.4",
+    version="0.0.6",
     readme="README.md",
     description="Coding Agent for Mac",
     long_description=open("README.md").read(),
@@ -14,5 +14,5 @@ setup(
     python_requires=">=3.12.8",
     install_requires=["mlx-lm>=0.31.3", "numpy", "httpx", "pydantic"],
     packages=find_packages(),
-    entry_points={"console_scripts": ["mc=mlx_code.main:main", "md=mlx_code.log:main", "me=mlx_code.pie:main"]},
+    entry_points={"console_scripts": ["mc=mlx_code.main:main", "md=mlx_code.log:main", "me=mlx_code.pie:main", "mr=mlx_code.symgraph:main"]},
 )

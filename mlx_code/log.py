@@ -187,12 +187,13 @@ def render_detail(panel, entry: dict):
     level = entry.get("level", "?")
     color = LEVEL_COLORS.get(level, 7)
 
-    put("time",     entry.get("timestamp", ""),    7)
+    put("time",     entry.get("timestamp", ""),     color)
     put("level",    level,                          color)
-    put("logger",   entry.get("logger", ""),        7)
-    put("file",     entry.get("file", ""),          7)
-    put("function", entry.get("function", ""),      7)
-    put("line",     str(entry.get("line", "")),     7)
+    put("logger",   entry.get("logger", ""),        color)
+    put("file",     entry.get("file", ""),          color)
+    put("function", entry.get("function", ""),      color)
+    put("line",     str(entry.get("line", "")),     color)
+    put("id",     str(entry.get("request_id", "")), color)
 
     extra = entry.get("extra", {})
     if extra:
@@ -219,7 +220,7 @@ def render_detail(panel, entry: dict):
         if row >= h - 1:
             break
         try:
-            panel.addstr(row, 2, line, curses.color_pair(2))
+            panel.addstr(row, 2, line, curses.color_pair(color))
         except curses.error:
             pass
         row += 1
@@ -259,12 +260,13 @@ def pager(stdscr, entry: dict):
         def field(label, value, col=7):
             lines.append((f"  {label:<11}: {value}", col))
 
-        field("time",      entry.get("timestamp", ""))
+        field("time",      entry.get("timestamp", ""), color)
         field("level",     level, color)
-        field("logger",    entry.get("logger", ""))
-        field("file",      entry.get("file", ""))
-        field("function",  entry.get("function", ""))
-        field("line",      str(entry.get("line", "")))
+        field("logger",    entry.get("logger", ""), color)
+        field("file",      entry.get("file", ""), color)
+        field("function",  entry.get("function", ""), color)
+        field("line",      str(entry.get("line", "")), color)
+        field("id",        str(entry.get("request_id", "")), color)
 
         extra = entry.get("extra", {})
         if extra:
@@ -277,7 +279,7 @@ def pager(stdscr, entry: dict):
         lines.append(("", 7))
         section("── message ──")
         for ln in wrap_text(entry.get("message", ""), w - 4):
-            lines.append(("  " + ln, 2))
+            lines.append(("  " + ln, color))
 
         exc = entry.get("exception")
         if exc:
@@ -451,13 +453,53 @@ def render_status(stdscr, cursor: int, total: int, all_total: int,
 
     status = (
         f"  {log_file}  │  {count_str}{filter_indicator}  │  "
-        "↑/k ↓/j · PgUp/PgDn · g/G · n/N related · * highlight · o open · ; filter · q quit  "
+        "↑/k ↓/j · PgUp/PgDn · g/G · n/N · * highlight · o open · ; filter · h/l tabs · q quit  "
     )
     try:
         stdscr.addstr(h - 1, 0, truncate(status, w - 1),
                       curses.color_pair(8))
     except curses.error:
         pass
+
+def build_tabs(entries: list[dict]) -> list[tuple[str, list[dict]]]:
+    groups: dict[str, list[dict]] = {}
+    order:  dict[str, str] = {}          
+    for e in entries:
+        rid = e.get("request_id")
+        if not rid:
+            continue
+        rid = str(rid)
+        groups.setdefault(rid, []).append(e)
+        ts = e.get("timestamp", "")
+        if rid not in order or ts < order[rid]:
+            order[rid] = ts
+    sorted_rids = sorted(order, key=lambda r: order[r])
+    tabs: list[tuple[str, list[dict]]] = [("All", entries)]
+    for rid in sorted_rids:
+        label = rid[:10] if len(rid) > 10 else rid
+        tabs.append((label, groups[rid]))
+    return tabs
+
+
+def render_tab_bar(stdscr, tabs: list[tuple[str, list[dict]]], tab_index: int):
+    h, w = stdscr.getmaxyx()
+    row = h - 2
+    x = 0
+    for i, (label, _) in enumerate(tabs):
+        tag = f" {label} "
+        if x + len(tag) >= w - 1:
+            break
+        attr = (curses.color_pair(8) | curses.A_BOLD) if i == tab_index else curses.color_pair(7)
+        try:
+            stdscr.addstr(row, x, tag, attr)
+        except curses.error:
+            pass
+        x += len(tag)
+    try:
+        stdscr.addstr(row, x, " " * max(0, w - 1 - x), curses.color_pair(7))
+    except curses.error:
+        pass
+
 
 def render_filter_bar(stdscr, filter_buf: str):
     h, w = stdscr.getmaxyx()
@@ -513,7 +555,7 @@ def tui(stdscr, entries, log_file, initial_filter="", initial_visible=None):
     def _make_windows(h, w):
         list_w   = max(int(w * 0.60), 40)
         detail_w = max(w - list_w, 30)
-        pane_h   = h - 1
+        pane_h   = h - 2   
         col_w = {
             "ts":   8,
             "lvl":  8,
@@ -527,30 +569,56 @@ def tui(stdscr, entries, log_file, initial_filter="", initial_visible=None):
     h, w = stdscr.getmaxyx()
     list_win, detail_win, list_w, detail_w, pane_h, col_widths = _make_windows(h, w)
 
-    related_keys = [_related_key(e) for e in visible_entries]
+    tabs:         list[tuple[str, list[dict]]] = build_tabs(visible_entries)
+    tab_index:    int  = 0
+    per_tab_cursor: dict[int, tuple[int, int]] = {}   
+
+    def current_tab_entries() -> list[dict]:
+        return tabs[tab_index][1] if tabs else []
+
+    def switch_tab(new_index: int):
+        nonlocal tab_index, cursor, scroll
+        per_tab_cursor[tab_index] = (cursor, scroll)
+        tab_index = new_index
+        cursor, scroll = per_tab_cursor.get(tab_index, (0, 0))
+
+    def rebuild_tabs():
+        nonlocal tabs, tab_index, cursor, scroll
+        per_tab_cursor.clear()
+        tabs = build_tabs(visible_entries)
+        tab_index = 0
+        cursor = 0
+        scroll = 0
+
+    related_keys = [_related_key(e) for e in current_tab_entries()]
 
     while True:
-        visible_rows = pane_h - 3 
+        tab_entries  = current_tab_entries()
+        visible_rows = pane_h - 3
 
-        if not visible_entries:
+        if not tab_entries:
             cursor = 0
             scroll = 0
             current = {}
         else:
-            cursor  = max(0, min(cursor, len(visible_entries) - 1))
-            current = visible_entries[cursor]
+            cursor  = max(0, min(cursor, len(tab_entries) - 1))
+            current = tab_entries[cursor]
 
         if cursor < scroll:
             scroll = cursor
         elif cursor >= scroll + visible_rows:
             scroll = cursor - visible_rows + 1
 
-        current_key = related_keys[cursor] if visible_entries else None
+        if len(related_keys) != len(tab_entries):
+            related_keys = [_related_key(e) for e in tab_entries]
 
-        render_list(list_win, visible_entries, cursor, scroll, col_widths,
+        current_key = related_keys[cursor] if tab_entries else None
+
+        render_list(list_win, tab_entries, cursor, scroll, col_widths,
                     highlight_on, related_keys)
         render_detail(detail_win, current)
-        render_status(stdscr, cursor, len(visible_entries),
+        render_tab_bar(stdscr, tabs, tab_index)
+        render_status(stdscr, cursor, len(tab_entries),
                       len(all_entries), log_file, active_filter)
         stdscr.noutrefresh()
         curses.doupdate()
@@ -559,7 +627,7 @@ def tui(stdscr, entries, log_file, initial_filter="", initial_visible=None):
 
         if key in (ord("q"), 27):
             break
-        elif key == ord("o") and visible_entries:
+        elif key == ord("o") and tab_entries:
             stdscr.clearok(True)
             pager(stdscr, current)
             stdscr.clearok(True)
@@ -568,34 +636,41 @@ def tui(stdscr, entries, log_file, initial_filter="", initial_visible=None):
             if result is not None:
                 active_filter   = result.strip()
                 visible_entries = apply_filter(all_entries, active_filter)
-                related_keys    = [_related_key(e) for e in visible_entries]
-                cursor = 0
-                scroll = 0
+                rebuild_tabs()
+                related_keys = [_related_key(e) for e in current_tab_entries()]
             stdscr.clearok(True)
-        elif key == ord("*"): 
+        elif key == ord("*"):
             highlight_on = not highlight_on
-        elif key == ord("n") and visible_entries:
-            for i in range(cursor + 1, len(visible_entries)):
+        elif key == ord("n") and tab_entries:
+            for i in range(cursor + 1, len(tab_entries)):
                 if related_keys[i] == current_key:
                     cursor = i
                     break
-        elif key == ord("N") and visible_entries:
+        elif key == ord("N") and tab_entries:
             for i in range(cursor - 1, -1, -1):
                 if related_keys[i] == current_key:
                     cursor = i
                     break
+        elif key in (ord("h"), curses.KEY_LEFT) and tab_index > 0:
+            related_keys = [_related_key(e) for e in current_tab_entries()]
+            switch_tab(tab_index - 1)
+            related_keys = [_related_key(e) for e in current_tab_entries()]
+        elif key in (ord("l"), curses.KEY_RIGHT) and tab_index < len(tabs) - 1:
+            related_keys = [_related_key(e) for e in current_tab_entries()]
+            switch_tab(tab_index + 1)
+            related_keys = [_related_key(e) for e in current_tab_entries()]
         elif key in (curses.KEY_UP, ord("k")):
             cursor = max(0, cursor - 1)
         elif key in (curses.KEY_DOWN, ord("j")):
-            cursor = min(max(len(visible_entries) - 1, 0), cursor + 1)
+            cursor = min(max(len(tab_entries) - 1, 0), cursor + 1)
         elif key in (curses.KEY_PPAGE,):
             cursor = max(0, cursor - 10)
-        elif key in (curses.KEY_NPAGE,): 
-            cursor = min(max(len(visible_entries) - 1, 0), cursor + 10)
+        elif key in (curses.KEY_NPAGE,):
+            cursor = min(max(len(tab_entries) - 1, 0), cursor + 10)
         elif key == ord("g"):
             cursor = 0
         elif key == ord("G"):
-            cursor = max(len(visible_entries) - 1, 0)
+            cursor = max(len(tab_entries) - 1, 0)
         elif key == curses.KEY_RESIZE:
             h, w = stdscr.getmaxyx()
             list_win, detail_win, list_w, detail_w, pane_h, col_widths = _make_windows(h, w)
