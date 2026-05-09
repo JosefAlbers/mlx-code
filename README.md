@@ -53,7 +53,6 @@ mc
 # Default: starts local MLX server and launches pie REPL
 mc
 
-
 # Choose a different harness
 mc --leash gemini
 mc --leash codex
