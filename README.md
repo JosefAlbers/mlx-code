@@ -85,7 +85,7 @@ me --api gemini
 me --api codex
 
 # Use a specific model
-me --api deepseek --model deepseek-chat
+me --api deepseek --model deepseek-v4-pro
 
 # Point to LLM API endpoint
 me --url http://localhost:9000
