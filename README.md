@@ -91,7 +91,7 @@ me --api deepseek --model deepseek-chat
 me --url http://localhost:9000
 ```
 
-### `md` — Log viewer
+### `md` — Viewer
 
 View and filter structured JSON logs from any session.
 
