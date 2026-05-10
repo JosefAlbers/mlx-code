@@ -405,7 +405,6 @@ def render_list(win, entries: list[dict], cursor: int, scroll: int,
         ts     = short_ts(entry.get("timestamp", ""))
         f_name = short_file(entry.get("file", ""))
 
-        # Draw marker (green '>') at column 1 if marked
         if marked_indices is not None and entry_to_master_index is not None:
             master_idx = entry_to_master_index.get(id(entry), -1)
             is_marked = master_idx in marked_indices
@@ -560,7 +559,6 @@ def tui(stdscr, entries, log_file, initial_filter="", initial_visible=None):
     cursor = 0
     scroll = 0
     highlight_on = False
-    # Marking state: store indices in all_entries
     entry_to_master_index = {id(e): idx for idx, e in enumerate(all_entries)}
     marked_indices = set()
 
@@ -586,7 +584,7 @@ def tui(stdscr, entries, log_file, initial_filter="", initial_visible=None):
     list_win, detail_win, list_w, detail_w, pane_h, col_widths = _make_windows(h, w)
 
     tabs: list[tuple[str, list[dict]]] = build_tabs(visible_entries)
-    tab_index: int = len(tabs) - 1 if tabs else 0   # start on rightmost tab
+    tab_index: int = len(tabs) - 1 if tabs else 0   
     per_tab_cursor: dict[int, tuple[int, int]] = {}
     for i in range(len(tabs)):
         per_tab_cursor[i] = (0, 0)
@@ -674,13 +672,13 @@ def tui(stdscr, entries, log_file, initial_filter="", initial_visible=None):
             if tab_index > 0:
                 switch_tab(tab_index - 1)
             else:
-                switch_tab(len(tabs) - 1)          # wrap to last tab
+                switch_tab(len(tabs) - 1)          
             related_keys = [_related_key(e) for e in current_tab_entries()]
         elif key in (ord("l"), curses.KEY_RIGHT):
             if tab_index < len(tabs) - 1:
                 switch_tab(tab_index + 1)
             else:
-                switch_tab(0)                      # wrap to first tab
+                switch_tab(0)                      
             related_keys = [_related_key(e) for e in current_tab_entries()]
         elif key == ord('v') and tab_entries:
             current_entry = tab_entries[cursor]
@@ -690,7 +688,6 @@ def tui(stdscr, entries, log_file, initial_filter="", initial_visible=None):
                     marked_indices.remove(master_idx)
                 else:
                     marked_indices.add(master_idx)
-                # Refresh list to update marker
                 render_list(list_win, tab_entries, cursor, scroll, col_widths,
                             highlight_on, related_keys,
                             marked_indices, entry_to_master_index)
@@ -728,7 +725,7 @@ def main():
 
     parser.add_argument(
         "-f", "--filter",
-        default=f"lvl:10;file:main,pie",
+        default=f"lvl:10;file:main,pie,ledger",
         help="Initial filter string (same syntax as in UI)"
     )
 

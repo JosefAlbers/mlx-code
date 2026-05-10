@@ -23,6 +23,7 @@ import hashlib
 import contextlib
 import functools
 import mlx.nn as nn
+from .ledger import create_worktree, commit_worktree #.
 from typing import (
     Any,
     Callable,
@@ -1370,16 +1371,18 @@ def stream_sse(format_type, seg_gen, msg_id, in_tokens, think_tags=None):
         yield adapter.end(False)
 # }}}dec
 # {{{ser
-def make_handler(model_name, cache_dir, system, names, skips, parse_think=True):
+def make_handler(model_name, cache_dir, system, names, skips, gwt=None, parse_think=True):
     model, tokenizer = mlx_lm.load(model_name)
     pc = PromptCache(model, model_name=model_name, cache_dir=cache_dir)
     if not isinstance(tokenizer, mlx_lm.tokenizer_utils.TokenizerWrapper):
         tokenizer = mlx_lm.tokenizer_utils.TokenizerWrapper(tokenizer)
-
+ 
+    gwt_cell = [gwt]  
+ 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
-
+ 
         def send_json(self, code: int, obj: dict):
             body = json.dumps(obj).encode()
             self.send_response(code)
@@ -1387,7 +1390,7 @@ def make_handler(model_name, cache_dir, system, names, skips, parse_think=True):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-
+ 
         def do_GET(self):
             if self.path.rstrip("/") == "/v1/models":
                 self.send_json(200, {
@@ -1434,11 +1437,14 @@ def make_handler(model_name, cache_dir, system, names, skips, parse_think=True):
                 with gen_lock:
                     abort_ev.clear()
                     prompt, ckpts = encode(body, api, tokenizer, system, names, skips)
+                    if ckpts is not None:
+                        gwt_cell[0] = commit_worktree(gwt_cell[0])
                     seg_gen = generate(model, tokenizer, prompt=prompt, ckpts=ckpts, pc=pc, max_tokens=body.get("max_tokens", 8192))
                     msg_id = f"msg_{uuid.uuid4().hex}"
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
                     self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")   
                     self.end_headers()
                     try:
                         for chunk in stream_sse(api, seg_gen, msg_id, len(prompt)):
@@ -1450,9 +1456,9 @@ def make_handler(model_name, cache_dir, system, names, skips, parse_think=True):
                 logger.exception(f'{self.path=}')
                 raise
     return Handler
-
-
-
+ 
+ 
+ 
 def serve(
     host: str,
     port: int,
@@ -1463,8 +1469,9 @@ def serve(
     skips: list[str],
     *,
     fixed_port: bool = False,
+    gwt=None,
 ) -> tuple[HTTPServer, str]:
-    handler = make_handler(model, cache, system, tools, skips)
+    handler = make_handler(model, os.path.abspath(cache), system, tools, skips, gwt)
     while True:
         try:
             server = HTTPServer((host, port), handler)
@@ -1479,16 +1486,16 @@ def serve(
                 port += 1
             else:
                 raise
-
-
+ 
+ 
 def mirror_workspace(src: str, dst: str) -> None:
     for root, dirs, files in os.walk(src):
         rel = os.path.relpath(root, src)
         os.makedirs(os.path.join(dst, rel), exist_ok=True)
         for f in files:
             os.link(os.path.join(root, f), os.path.join(dst, rel, f))
-
-
+ 
+ 
 def run(
     leash: str,
     url: str,
@@ -1498,50 +1505,45 @@ def run(
     tools: list[str],
     skill: str | None,
     leash_args: list[str],
+    gwt_worktree: str,
 ) -> None:
     env = os.environ.copy()
-
-    with tempfile.TemporaryDirectory() as _home:
-        home = Path(_home)
-        env["HOME"] = str(home)
-        env["SHELL"] = "/bin/bash"
-
-        workspace = home / "workspace"
-        mirror_workspace(work, str(workspace))
-
-        if leash == "pie":
-            from .pie import harness  # .
-            harness(base_url=url, api=leash, cwd=str(workspace), env=env,
-                system=system, tools=tools, sdir=skill)
-
-        else:
-            env["GOOGLE_GEMINI_BASE_URL"] = url
-            env["GEMINI_API_KEY"] = "mc"
-            env.pop("OPENAI_API_KEY", None)
-
-            codex_dir = home / ".codex"
-            codex_dir.mkdir(parents=True, exist_ok=True)
-            (codex_dir / "config.toml").write_text(f"""
+    env["HOME"] = gwt_worktree
+    env["SHELL"] = "/bin/bash"
+ 
+    if leash == "pie":
+        from .pie import harness  #.
+        harness(base_url=url, api=leash, cwd=gwt_worktree, env=env,
+            system=system, tools=tools, sdir=skill)
+ 
+    else:
+        env["GOOGLE_GEMINI_BASE_URL"] = url
+        env["GEMINI_API_KEY"] = "mc"
+        env.pop("OPENAI_API_KEY", None)
+ 
+        codex_dir = Path(gwt_worktree) / ".codex"
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        (codex_dir / "config.toml").write_text(f"""
 [model_providers.local]
 name = "openai"
 base_url = "{url}/v1"
 api_key = "mc"
-
+ 
 [profiles.local]
 model_provider = "local"
 model = "gpt-5.4-mini"
 """.strip())
-
-            env["ANTHROPIC_BASE_URL"] = url
-            env["ANTHROPIC_AUTH_TOKEN"] = "mc"
-            env["ANTHROPIC_MODEL"] = model
-
-            if leash == "codex":
-                leash_args = leash_args + ['--profile', 'local']
-
-            sys.exit(subprocess.run([leash] + leash_args, env=env, cwd=workspace).returncode)
-
-
+ 
+        env["ANTHROPIC_BASE_URL"] = url
+        env["ANTHROPIC_AUTH_TOKEN"] = "mc"
+        env["ANTHROPIC_MODEL"] = model
+ 
+        if leash == "codex":
+            leash_args = leash_args + ['--profile', 'local']
+ 
+        sys.exit(subprocess.run([leash] + leash_args, env=env, cwd=gwt_worktree).returncode)
+ 
+ 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--model", default="mlx-community/Qwen3.5-4B-OptiQ-4bit")
@@ -1549,7 +1551,7 @@ def main():
     parser.add_argument("--skill", default=None, help="Directory to scan for skills")
     parser.add_argument("--tools", nargs="+", default=None, help="Allow all tools if None (default None)")
     parser.add_argument("--system", type=str, default=None, help="System prompt override")
-    parser.add_argument("--cache", type=str, default='cache')
+    parser.add_argument("--cache", type=str, default='.cache')
     parser.add_argument("--work", default=os.getcwd())
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=None, help="8000 if None (default None)")
@@ -1559,39 +1561,45 @@ def main():
     ])
     args, leash_args = parser.parse_known_args()
     logger.debug(f'{args=} {leash_args=}')
-
+ 
     system = None if args.leash in ('none', 'pie') else args.system
-
-    server, url = serve(
-        host=args.host,
-        port=args.port if args.port is not None else 8000,
-        model=args.model,
-        cache=args.cache,
-        system=system,
-        tools=args.tools,
-        skips=args.skips,
-        fixed_port=args.port is not None,
-    )
-
-    if args.leash == "none":
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            print("\nShutting down server...")
-            server.server_close()
-    else:
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        run(
-            leash=args.leash,
-            url=url,
-            work=args.work,
+ 
+    with tempfile.TemporaryDirectory() as _home:
+        home = Path(_home)
+        gwt = None if args.leash == 'none' else create_worktree(args.work, worktree_dir=str(home / "workspace"))
+ 
+        server, url = serve(
+            host=args.host,
+            port=args.port if args.port is not None else 8000,
             model=args.model,
+            cache=args.cache,
             system=system,
             tools=args.tools,
-            skill=args.skill,
-            leash_args=leash_args,
+            skips=args.skips,
+            fixed_port=args.port is not None,
+            gwt=gwt,
         )
-
+ 
+        if args.leash == "none":
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                print("\nShutting down server...")
+                server.server_close()
+        else:
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            run(
+                leash=args.leash,
+                url=url,
+                work=args.work,
+                model=args.model,
+                system=system,
+                tools=args.tools,
+                skill=args.skill,
+                leash_args=leash_args,
+                gwt_worktree=gwt.worktree,
+            )
+ 
 if __name__ == "__main__":
     main()
 # }}}ser

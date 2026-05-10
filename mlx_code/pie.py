@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Literal, TypeAlias, Union
 import httpx
 from pydantic import BaseModel, Field, ValidationError
+from .ledger import create_worktree, commit_worktree #.
 import sys, tty, termios
 import logging
 
@@ -205,7 +206,7 @@ class ClaudeChat:
         self.model = "claude-haiku-4-5" if model is None else model
         self.api_key = os.environ.get("ANTHROPIC_API_KEY") if api_key is None else api_key
         if not self.api_key:
-            logger.warning('No api-key')
+            logger.debug('No api key')
         self.base_url = "https://api.anthropic.com" if base_url is None else base_url.rstrip("/")
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -443,7 +444,7 @@ class DefaultChat:
     ) -> None:
         self.model = "jj" if model is None else model
         if api_key is None:
-            logger.warning('No api-key')
+            logger.debug('No api key')
         self.api_key = "jj" if api_key is None else api_key
         self.base_url = "http://127.0.0.1:8000" if base_url is None else base_url.rstrip("/")
         self.max_tokens = max_tokens
@@ -650,7 +651,7 @@ class GeminiChat:
         self.model = "gemini-3.1-flash-lite-preview" if model is None else model
         self.api_key = os.environ.get("GEMINI_API_KEY") if api_key is None else api_key
         if not self.api_key:
-            logger.warning('No api-key')
+            logger.debug('No api key')
         self.base_url = "https://generativelanguage.googleapis.com" if base_url is None else base_url.rstrip("/")
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -867,7 +868,7 @@ class CodexChat:
         self.model = "gpt-5.4-mini" if model is None else model
         self.api_key = os.environ.get("OPENAI_API_KEY") if api_key is None else api_key
         if not self.api_key:
-            logger.warning('No api-key')
+            logger.debug('No api key')
         self.base_url = "https://api.openai.com" if base_url is None else base_url.rstrip("/")
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -1073,20 +1074,37 @@ class API:
         tools: list[Tool],
     ) -> EventStream: ...
 
-
 class Agent:
     def __init__(
         self,
-        api: Any,
-        system: str = "",
-        tools: list[Tool] | None = None,
+        api,
+        system,
+        tools = None,
+        model = None,
+        api_key = None,
+        base_url = None,
+        gwt=None,
     ) -> None:
+        if api == "claude":
+            api = ClaudeChat(model=model, api_key=api_key, base_url=base_url)
+        elif api == "gemini":
+            api = GeminiChat(model=model, api_key=api_key, base_url=base_url)
+        elif api == "codex":
+            api = CodexChat(model=model, api_key=api_key, base_url=base_url)
+        else:
+            api = DefaultChat(model=model, api_key=api_key, base_url=base_url)
         self.api = api
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url
+        self._api = api
         self.system = system
-        self.tools: list[Tool] = tools or []
+        tools = tools or []
+        self.tools = tools + [AgentTool(self)]
         self.messages: list[Message] = []
         self._signal: asyncio.Event | None = None
         self._listeners: set[Callable] = set()
+        self.gwt = gwt
 
     async def run(self, prompt: str) -> AssistantMessage:
         if self._signal is None or not self._signal.is_set():
@@ -1100,7 +1118,7 @@ class Agent:
         self._signal.set()
 
     def branch(self) -> "Agent":
-        child = Agent(api=self.api, system=self.system, tools=list(self.tools))
+        child = Agent(api=self.api, system=self.system, tools=list(self.tools), model=self.model,api_key=self.api_key, base_url=self.base_url, gwt=self.gwt)
         child.messages = list(self.messages)
         return child
 
@@ -1121,7 +1139,7 @@ class Agent:
         while True:
             await self._emit(AgentEvent("turn_start"))
 
-            es = await self.api.stream(self.messages, self.system, self.tools)
+            es = await self._api.stream(self.messages, self.system, self.tools)
 
             async for event in es:
                 if event.type == "text_delta":
@@ -1149,6 +1167,8 @@ class Agent:
                 break
 
             results = await self._execute_tools(tool_calls)
+            self.gwt = commit_worktree(self.gwt)
+            logger.debug(results)
             self.messages.extend(results)
 
             if self._signal and self._signal.is_set():
@@ -1177,7 +1197,6 @@ class Agent:
             except Exception as exc:
                 result = ToolResult(content=[TextContent(str(exc))], is_error=True)
 
-        logger.info('\n'.join(_t.text for _t in result.content))
         msg = ToolResultMessage(
             tool_call_id=call.id,
             tool_name=call.name,
@@ -1358,7 +1377,7 @@ class BashTool(Tool):
             raise ValueError(f"Command timed out after {params.timeout}s")
         output = stdout.decode(errors="replace")
         exit_code = proc.returncode or 0
-        # result = f"$ {params.command}\n{output}"
+        # result = f"$ {params.command}\n{output}" # □
         result = str(output) + ' '
         if exit_code != 0:
             result += f"\n[exit code {exit_code}]"
@@ -1565,7 +1584,7 @@ class ReadTreeTool(Tool):
         self.cwd = cwd or os.getcwd()
 
     async def execute(self, params: ReadTreeParams, signal=None) -> ToolResult:
-        from .symgraph import (  #.
+        from .sittree import (  #.
             outline_path, print_outline,
             search_symbols, format_search_results,
             resolve_lang_ext, Capability,
@@ -1636,16 +1655,118 @@ class GetSkillTool(Tool):
             return ToolResult(content=[TextContent(f"Skill '{params.name}' not found.")], is_error=True)
         return ToolResult(content=[TextContent(content)])
 
+class AgentParams(BaseModel):
+    task: str = Field(description=( "Clear autonomous task for the sub-agent. Should include objective, constraints, expected output, and relevant context."))
+    api: str | None = Field(default=None, description=("API/backend override for the sub-agent (e.g. claude, gemini, codex). Defaults to parent agent backend."))
+    system: str | None = Field(default=None, description=("Optional replacement system prompt for the sub-agent. If omitted, inherits parent system prompt."))
+    tools: list[str] | str | None = Field(default=None, description=("Restrict available tools for the sub-agent. Example: ['Read', 'Edit', 'Bash']. If omitted, inherits all parent tools."))
+    # ref:      str       = Field(default="", description="Git branch or sha to start from. Empty = current branch.") # □ todo
+ 
+ 
+class AgentTool(Tool):
+    name = "Agent"
 
-def coding_tools(cwd: str | None = None) -> list[Tool]:
-    return [ReadTool(cwd), WriteTool(cwd), EditTool(cwd), BashTool(cwd)]
+    description = """
+Spawn an autonomous sub-agent in an isolated git worktree.
 
-def readonly_tools(cwd: str | None = None) -> list[Tool]:
-    return [ReadTool(cwd), GrepTool(cwd), FindTool(cwd), LsTool(cwd)]
+The sub-agent is a full agent instance with:
+- its own conversation history
+- its own reasoning loop
+- its own tool execution cycle
+- its own git worktree/branch
+- inherited or overridden system prompt
+- restricted or inherited tools
 
-def all_tools(cwd: str | None = None, skills: list[dict] | None = None) -> list[Tool]:
-    return [ReadTool(cwd), WriteTool(cwd), EditTool(cwd), BashTool(cwd),
-            GrepTool(cwd), FindTool(cwd), LsTool(cwd), ReadTreeTool(cwd)]
+Use this tool to delegate complex, multi-step, or parallelizable work.
+
+Good use cases:
+- implementing a self-contained feature
+- investigating bugs
+- performing deep codebase research
+- running long tool chains
+- generating/refactoring code
+- testing alternative implementations
+- summarizing large subsystems
+- parallel exploration of different approaches
+
+Avoid using Agent for:
+- trivial single-step operations
+- simple reads/searches
+- tiny edits
+- tasks requiring tight conversational continuity
+- tasks where direct tool usage is cheaper/simpler
+
+The sub-agent does NOT stream intermediate reasoning or tool usage back.
+Only the final response is returned.
+
+The sub-agent operates independently and may:
+- read/write/edit files
+- run bash commands
+- invoke tools repeatedly
+- spawn additional agents (if Agent tool is allowed)
+
+Context inheritance:
+- system prompt defaults to parent system
+- tools default to inherited tools
+- model/api settings default to parent
+- git state/worktree is isolated
+
+Tool restriction:
+Pass a limited tool list to constrain the sub-agent.
+This is strongly recommended for focused tasks.
+
+Examples:
+- Investigate failing tests and explain root cause
+- Implement parser refactor using only Read/Edit/Bash
+- Analyze auth flow and summarize architecture
+- Search entire repo for dead code candidates
+- Prototype an alternative implementation in isolation
+
+Delegation tips:
+- Give concrete goals
+- Specify constraints
+- Define expected output
+- Restrict tools when possible
+- Prefer focused subtasks over vague broad objectives
+- Prefer multiple specialized agents over one giant task
+"""
+    parameters = AgentParams
+ 
+    def __init__(self, parent) -> None:
+        self.parent = parent
+ 
+    async def execute(self, params, signal=None) -> ToolResult:
+        api = params.api if params.api is not None else self.parent.api
+        system = params.system if params.system is not None else self.parent.system
+        tools_raw = params.tools
+        if isinstance(tools_raw, str):
+            tools_raw = json.loads(tools_raw)
+        if tools_raw is not None:
+            tools_raw = [t for t in tools_raw if isinstance(t, str)]
+        tools = [t for t in self.parent.tools if t.name.lower() in {n.lower() for n in params.tools}] if params.tools is not None else self.parent.tools
+        agent = Agent(api=api, system=system, tools=tools, model=self.parent.model, api_key=self.parent.api_key, base_url=self.parent.base_url, gwt=self.parent.gwt) # □ todo
+        try:
+            result = await agent.run(params.task)
+            texts = [b.text for b in result.content if isinstance(b, TextContent)]
+            return ToolResult(content=[TextContent(''.join(texts).strip())])
+        except Exception as e:
+            return ToolResult(content=[TextContent(f"Agent failed: {e}")], is_error=True)
+
+def collect_tools(tools: str | None = None, skills: list[dict] | None = None, cwd: str | None = None) -> list[Tool]:
+    available_tools = [ReadTool(cwd), WriteTool(cwd), EditTool(cwd), BashTool(cwd), GrepTool(cwd), FindTool(cwd), LsTool(cwd), ReadTreeTool(cwd)]
+    if skills:
+        available_tools.append(GetSkillTool(skills))
+    if tools is not None:
+        requested_names = {name.lower() for name in tools}
+        available_tools = [
+            t for t in available_tools
+            if t.name.lower() in requested_names
+        ]
+        found_names = {t.name.lower() for t in available_tools}
+        for req in requested_names:
+            if req not in found_names:
+                logger.warning(f"Tool '{req}' is not recognized.")
+    return available_tools
 
 _REPL_HELP = """\
 Commands:
@@ -1722,25 +1843,14 @@ def read_input(prompt: str = "\033[32m≫\033[0m ") -> str:
 async def repl(
     api: Any,
     system: str,
-    cwd: str | None = None,
-    tools: list[str] | None = None,
+    tools: list[Tool] | None = None,
     skills: list[dict] | None = None,
+    api_key = None,
+    base_url = None, 
+    gwt = None,
 ) -> None:
     is_tty = sys.stdin.isatty()
-    available_tools = all_tools(cwd)
-    if tools is not None:
-        requested_names = {name.lower() for name in tools}
-        available_tools = [
-            t for t in available_tools
-            if t.name.lower() in requested_names
-        ]
-        found_names = {t.name.lower() for t in available_tools}
-        for req in requested_names:
-            if req not in found_names:
-                logger.warning(f"Tool '{req}' is not recognized.")
-    if skills:
-        available_tools.append(GetSkillTool(skills))
-    agent = Agent(api, system=system, tools=available_tools)
+    agent = Agent(api, system, tools=tools, api_key=api_key, base_url=base_url, gwt=gwt)
     loop = asyncio.get_running_loop()
 
     _suppress = False
@@ -1924,26 +2034,20 @@ def harness(
     env: dict[str, str] | None = None,
     tools: list[str] | None = None,
     api_key: str | None = None,
+    gwt = None,
 ) -> None:
+    cwd = os.getcwd() if cwd is None else os.path.abspath(cwd)
+    sdir = cwd if sdir is None else os.path.abspath(sdir)
     if env is not None:
         os.environ.clear()
         os.environ.update(env)
-    cwd = os.getcwd() if cwd is None else cwd
-    sdir = cwd if sdir is None else sdir
-    skills = [] if skills is None else skills
+    os.chdir(cwd)
     skills, skill_prompt = collect_skills(sdir, skills)
+    tools = collect_tools(tools, skills, cwd)
     system = '\n\n'.join(filter(None, [system, skill_prompt]))
 
-    if api == "claude":
-        api = ClaudeChat(model=model, api_key=api_key, base_url=base_url)
-    elif api == "gemini":
-        api = GeminiChat(model=model, api_key=api_key, base_url=base_url)
-    elif api == "codex":
-        api = CodexChat(model=model, api_key=api_key, base_url=base_url)
-    else:
-        api = DefaultChat(model=model, api_key=api_key, base_url=base_url)
     try:
-        asyncio.run(repl(api, system=system, cwd=cwd, tools=tools, skills=skills))
+        asyncio.run(repl(api, system, tools=tools, skills=skills, api_key=api_key, base_url=base_url, gwt=gwt))
     except KeyboardInterrupt:
         print("\nExiting...")
 
@@ -1979,16 +2083,23 @@ def main():
             url = "https://generativelanguage.googleapis.com" if api_key else url
             model = "gemini-3.1-flash-lite-preview" if model is None else model
         tools = [] if tools is None else tools # □
-    harness(
-        api=args.api, 
-        system=args.system, 
-        cwd=args.cwd,
-        model=model, 
-        base_url=url, 
-        tools=tools,
-        sdir=args.skill,
-        api_key=api_key
-    )
+
+    import tempfile
+    repo = args.cwd or os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        gwt = create_worktree(repo, worktree_dir=os.path.join(tmp, 'workspace'))
+
+        harness(
+            api=args.api,
+            system=args.system,
+            cwd=gwt.worktree,       
+            model=model,
+            base_url=url,
+            tools=tools,
+            sdir=args.skill,
+            api_key=api_key,
+            gwt=gwt,        
+        )
 
 if __name__ == "__main__":
     main()

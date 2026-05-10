@@ -20,6 +20,7 @@ So the terminal stays the interface. Text in, text out. No full-screen TUI fight
 
 - [**main.py**](https://github.com/JosefAlbers/mlx-code/blob/main/mlx_code/main.py): LLM server for Apple Silicon. It loads quantized models and exposes a standard OpenAI-compatible completions endpoint.
 - [**pie.py**](https://github.com/JosefAlbers/mlx-code/blob/main/mlx_code/pie.py): Agentic harness based on Mario Zechner's awesome [pi](https://github.com/badlogic/pi-mono)).
+- [**ledger.py**](https://github.com/JosefAlbers/mlx-code/blob/main/mlx_code/ledger.py): Git worktree manager that creates isolated branches and working directories for every agent (and sub‑agen) runs.
 
 The CLI is intentionally boring and familiar:
 
@@ -35,10 +36,14 @@ That's the [constraint](https://jordanlord.co.uk/blog/3-constraints/) that shape
 
 ## Features
 
-- **Multi-Provider Compatibility**: Translates and handles requests formatted for Claude, Gemini, Codex, and DeepSeek.
-- **Built-in REPL & Tools**: [`pie`](https://github.com/JosefAlbers/mlx-code/blob/main/mlx_code/pie.py) is a fully-featured REPL with tool execution and reasoning token support.
-- **Prompt Caching**: KV cache is saved to disk and reused across requests automatically.
-- **Server Mode**: Spin up a local LLM server with one command.
+- **Local or remote execution**: Run models locally via MLX or connect to Claude, Gemini, Codex, DeepSeek, or any OpenAI‑compatible endpoint.
+- **Git worktree isolation**: Every agent run (and every sub‑agent) lives in its own git worktree and branch. Changes are automatically snapshotted (`commit_worktree`), and you can `cleanup_worktree` when done. This makes experimentation safe and fully reversible.
+- **Autonomous sub‑agents**: Spawn isolated agents in fresh git worktrees. Each sub‑agent has its own conversation, tool set, and working directory. They can be used for parallel exploration, refactoring, or deep research without polluting the main context.
+- **Symbol‑aware source inspection (`ReadTree`)**: Uses tree‑sitter to outline code or fetch exact definitions/calls for a symbol. Drastically reduces token usage compared to reading full files.
+- **Built‑in tools**: Read, Write, Edit, Bash, Grep, Find, Ls, ReadTree, GetSkill, and Agent.
+- **Prompt caching**: KV cache is saved to disk and reused across requests automatically.
+- **REPL with `/commands`**: `/clear`, `/history`, `/tools`, `/branch`, `/abort`, `/help`.
+- **TUI log viewer (`md`)**: Explore structured JSON logs with filtering by level, file, function, etc. Mark entries to export.
 
 ## Quick Start
 
@@ -54,10 +59,10 @@ mc
 ### `mc`: Local agent (LLM server ± harness)
 
 ```bash
-# Default: starts local MLX server and launches the default pie harness
+# Start local MLX server and launch the default pie harness (Default)
 mc
 
-# Choose a different harness
+# Choose a different harness (claude, gemini, codex, deepseek, pie)
 mc --leash gemini
 mc --leash codex
 mc --leash claude
@@ -65,17 +70,23 @@ mc --leash claude
 # Server only, no harness
 mc --leash none
 
-# Limit available tools
+# Limit allowed tools
 mc --tools Ls ReadTree Edit
+
+# Use a custom system prompt
+mc --system "You are a helpful Python expert."
+
+# Load skills from a directory
+mc --skill ./my-skills
 
 # Shell piping and chaining
 echo "explain symgraph.py" | mc -d | cat - PLAN.md | mc
 ```
 
-### `me`: Harness
+### `me`: Harness (connects to API)
 
 ```bash
-# Default: connects to local server at 127.0.0.1:8000
+# Connect to local server at 127.0.0.1:8000 (Default)
 me
 
 # Use a remote provider
@@ -84,22 +95,34 @@ me --api claude
 me --api gemini
 me --api codex
 
-# Use a specific model
+# Specify model
 me --api deepseek --model deepseek-v4-pro
 
-# Point to LLM API endpoint
+# Point to a custom LLM API endpoint
 me --url http://localhost:9000
+
+# Load skills from a directory
+me --skill ./my-skills
 ```
 
-### `md`: Viewer
+### `md`: TUI log viewer
 
 View and filter structured JSON logs from any session.
 
 ```bash
 md
-md --filter lvl:10;file:main,pie
-md --out picks
+md --filter "lvl:10;file:main,pie"    # show DEBUG logs from main.py and pie.py
+md --out picks.json                   # write marked entries to a file
 ```
+
+Inside the TUI:
+- `j/k` or ↑/↓ – navigate
+- `o` – open detailed view for current entry
+- `*` – highlight related entries (same file/function)
+- `;` – set a live filter
+- `h/l` – switch between request‑grouped tabs
+- `v` – mark/unmark entry for export
+- `q` – quit (marked entries printed or saved with `--out`)
 
 <details><summary>Click to expand</summary><pre>
 
@@ -475,6 +498,26 @@ md --out picks
 
 </pre></details><br>
 
+## Tools Overview
+
+| Tool        | Description |
+|-------------|-------------|
+| `Read`      | Read a file (supports offset/limit for large files). |
+| `Write`     | Create or overwrite a file. |
+| `Edit`      | Replace a unique string in a file. |
+| `Bash`      | Run a shell command (timeout, stdout+stderr). |
+| `Grep`      | Search file contents with regex, respects `.gitignore`. |
+| `Find`      | Find files/directories by name pattern. |
+| `Ls`        | List directory contents (respects `.gitignore`). |
+| `ReadTree`  | Outline a file/directory or fetch exact bodies of definitions/calls. Uses tree‑sitter and works for many languages (Python, JS/TS, Go, Rust, Java, C/C++, C#, Ruby, etc.). |
+| `GetSkill`  | Retrieve full instructions for a named skill (from `--skill` directory). |
+| `Agent`     | Spawn an autonomous sub‑agent in an isolated git worktree. For parallel tasks, deep research, or safe experimentation. |
+
+## Skills
+
+Skills are directories containing a `SKILL.md` file with frontmatter (`name:` and `description:`). Place them in a directory and pass `--skill <dir>`. The agent will list available skills and can load their full instructions via `GetSkill`. This keeps the system prompt lean while allowing on‑demand detailed guidance.
+
+
 ## Credits
 
 - `main.py`: Built on [mlx](https://github.com/ml-explore/mlx) and [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple.
@@ -483,4 +526,3 @@ md --out picks
 ## Licence
 
 Apache License 2.0 — see LICENSE for details.
-
