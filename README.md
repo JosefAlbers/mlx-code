@@ -40,7 +40,7 @@ That's the [constraint](https://jordanlord.co.uk/blog/3-constraints/) that shape
 - **Prompt Caching**: KV cache is saved to disk and reused across requests automatically.
 - **Server Mode**: Spin up a local LLM server with one command.
 
-### Quick Start
+## Quick Start
 
 Install via pip and launch the agent immediately:
 
