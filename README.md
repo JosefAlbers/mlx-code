@@ -19,7 +19,7 @@ So the terminal stays the interface. Text in, text out. No full-screen TUI fight
 `mlx-code` has two lightweight, loosely coupled pieces:
 
 - [**main.py**](https://github.com/JosefAlbers/mlx-code/blob/main/mlx_code/main.py): LLM server for Apple Silicon. It loads quantized models and exposes a standard OpenAI-compatible completions endpoint.
-- [**pie.py**](https://github.com/JosefAlbers/mlx-code/blob/main/mlx_code/pie.py) — Agentic harness based on Mario Zechner's awesome [pi](https://github.com/badlogic/pi-mono)).
+- [**pie.py**](https://github.com/JosefAlbers/mlx-code/blob/main/mlx_code/pie.py): Agentic harness based on Mario Zechner's awesome [pi](https://github.com/badlogic/pi-mono)).
 
 The CLI is intentionally boring and familiar:
 
