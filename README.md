@@ -20,67 +20,67 @@ A lightweight coding agent built on Apple's MLX framework.
 
 ```bash
 pip install mlx-code[all]
-mlxc
+mlc
 ```
 
 ---
 
 ## Command Line
 
-### `mlxc`: local server + harness
+### `mlc`: local server + harness
 
 Starts the MLX inference server and launches a harness against it.
 
 ```bash
 # Default: local MLX server + built-in REPL harness
-mlxc
+mlc
 
 # Use a different harness (routes traffic through the local server)
-mlxc --leash claude
-mlxc --leash gemini
-mlxc --leash codex
+mlc --leash claude
+mlc --leash gemini
+mlc --leash codex
 
 # Server only, no harness
-mlxc --leash none
+mlc --leash none
 
 # Specify a model
-mlxc --model mlx-community/Qwen3.5-4B-OptiQ-4bit
+mlc --model mlx-community/Qwen3.5-4B-OptiQ-4bit
 
 # Restrict the tools available to the agent
-mlxc --tools Read Write Bash
+mlc --tools Read Write Bash
 
 # Custom system prompt
-mlxc --system "You are a helpful assistant."
+mlc --system "You are a helpful assistant."
 
 # Load skills from a directory (scans recursively for SKILL.md files)
-mlxc --skill ./my-skills
+mlc --skill ./my-skills
 
 # Resume a previous session from a git commit hash
-mlxc --resume <commit-hash>
+mlc --resume <commit-hash>
 
-# Because `mlxc` reads from stdin when it isn't a TTY, it composes naturally with shell pipes:
-echo "explain lsp.py" | mlxc -d | cat - PLAN.md | mlxc
+# Because `mlc` reads from stdin when it isn't a TTY, it composes naturally with shell pipes:
+echo "explain lsp.py" | mlc -d | cat - PLAN.md | mlc
 ```
 
-### `mlxc-run`: harness only
+### `mlc-run`: harness only
 
 Runs the agent harness against an already-running server or a remote provider.
 
 ```bash
 # Connect to a local server at 127.0.0.1:8000 (default)
-mlxc-run
+mlc-run
 
 # Remote providers
-mlxc-run --api claude
-mlxc-run --api gemini
-mlxc-run --api deepseek --model deepseek-v4-pro
-mlxc-run --api codex
+mlc-run --api claude
+mlc-run --api gemini
+mlc-run --api deepseek --model deepseek-v4-pro
+mlc-run --api codex
 
 # Custom endpoint
-mlxc-run --url http://localhost:9000
+mlc-run --url http://localhost:9000
 
 # With skills
-mlxc-run --skill ./my-skills
+mlc-run --skill ./my-skills
 ```
 
 ---
