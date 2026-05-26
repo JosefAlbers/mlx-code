@@ -59,7 +59,7 @@ mlc --skill ./my-skills
 mlc --resume <commit-hash>
 
 # Because `mlc` reads from stdin when it isn't a TTY, it composes naturally with shell pipes:
-echo "explain lsp.py" | mlc -d | cat - PLAN.md | mlc
+echo "explain lsp.py" | mlc -a deepseek | cat - PLAN.md | mlc
 ```
 
 ### `mlc-run`: harness only
