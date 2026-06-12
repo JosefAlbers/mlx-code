@@ -2,11 +2,16 @@ from setuptools import setup, find_packages
 
 setup(
     name="mlx-code",
-    url="https://github.com/JosefAlbers/mlx-code",
+    url="https://josefalbers.github.io/mlx-code/",
+    project_urls={
+        "Source": "https://github.com/JosefAlbers/mlx-code",
+        "Issues": "https://github.com/JosefAlbers/mlx-code/issues",
+        "Documentation": "https://josefalbers.github.io/mlx-code/",
+    },
     author_email="albersj66@gmail.com",
     author="J Joe",
     license="Apache-2.0",
-    version="0.0.11",
+    version="0.0.18",
     readme="README.md",
     description="Coding Agent for Mac",
     long_description=open("README.md").read(),
@@ -16,9 +21,15 @@ setup(
         "mlx-lm>=0.31.3; platform_system=='Darwin'",
         "httpx",
         "pydantic",
-        "GitPython",
+
+        "textual>=8.2.7",
+        "rich>=15.0.0",
     ],
-    extras_require={"all": ["python-lsp-server[all]"]},
+    extras_require={"all": [
+        "python-lsp-server[all]",
+        "GitPython", 
+        "pygments",
+    ]},
     packages=find_packages(),
     entry_points={
         "console_scripts": [
