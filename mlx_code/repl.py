@@ -789,7 +789,7 @@ class ReplApp(App[None]):
             else:
                 self.query_one('#helpbar', HelpBar).show_error('Nothing is running.')
         elif cmd == '/branch':
-            as_worktree = False
+            as_worktree = True
             rev_n: int | None = None
             prompt = arg
             if '--no-worktree' in prompt:
