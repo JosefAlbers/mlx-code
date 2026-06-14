@@ -871,13 +871,13 @@ def make_handler(model_name, cache_dir, system, names, skips, gwt=None, parse_th
                 raise
     return Handler
 
-def serve(host: str, port: int, model: str, cache: str, system: str | None, tools: list[str], skips: list[str], *, fixed_port: bool=False, gwt=None) -> tuple[HTTPServer, str]:
+def _serve_cache(host, port, model, cache, system, tools, skips, *, fixed_port=False, gwt=None):
     handler = make_handler(model, cache, system, tools, skips, gwt)
     while True:
         try:
             server = HTTPServer((host, port), handler)
             url = f'http://{host}:{port}'
-            logger.debug(f'Server bound to {url}')
+            logger.debug(f'Cache server bound to {url}')
             return (server, url)
         except OSError as e:
             if e.errno in (48, 98):
@@ -888,12 +888,52 @@ def serve(host: str, port: int, model: str, cache: str, system: str | None, tool
             else:
                 raise
 
+def _serve_batch(host, port, model, cache_dir='.cache', *, fixed_port=False):
+    import uvicorn
+    from .bats import make_batch_app
+    import socket
+    import time
+    app = make_batch_app(model, cache_dir=cache_dir)
+    while True:
+        try:
+            with socket.socket() as s:
+                s.bind((host, port))
+        except OSError as e:
+            if e.errno in (48, 98):
+                if fixed_port:
+                    logger.error(f'Port {port} is already in use.')
+                    sys.exit(1)
+                port += 1
+            else:
+                raise
+        else:
+            break
+    config = uvicorn.Config(app, host=host, port=port, loop='asyncio', log_level='warning')
+    uv_server = uvicorn.Server(config)
+    t = threading.Thread(target=uv_server.run, daemon=True)
+    t.start()
+    start_time = time.time()
+    notified = False
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=0.1):
+                break
+        except OSError:
+            if not notified and time.time() - start_time > 3.0:
+                logger.info('Waiting for batch server to start (model may be downloading)...')
+                notified = True
+            time.sleep(0.2)
+    url = f'http://{host}:{port}'
+    logger.debug(f'Batch server bound to {url}')
+    return (uv_server, url)
+
 def main():
     parser = argparse.ArgumentParser(description='mlx-code MAIN')
     parser.add_argument('-p', '--prompt', default=None, help='Initial prompt sent automatically when the REPL starts')
     parser.add_argument('-r', '--resume', default=None, metavar='COMMIT', help='Resume a previous session from the given git commit hash')
     parser.add_argument('-m', '--model', default='mlx-community/Qwen3.5-4B-OptiQ-4bit', help='MLX model path or HuggingFace repo ID (default: Qwen3.5-4B-OptiQ-4bit)')
     parser.add_argument('-l', '--leash', choices=['claude', 'codex', 'gemini', 'noapi', 'none'], default='noapi', help="AI harness to launch against the server; 'noapi' starts the built-in REPL, 'none' runs the server only")
+    parser.add_argument('--engine', choices=['cache', 'batch'], default='cache', help="'cache' uses PromptCache + single-sequence (default); 'batch' uses BatchGenerator for concurrent sequences (only compatible with --leash none or noapi)")
     parser.add_argument('--skill', default=None, help='Directory to scan recursively for SKILL.md files')
     parser.add_argument('--tools', nargs='+', default=None, help='Whitelist of tool names to enable; allows all tools when omitted')
     parser.add_argument('--system', type=str, default=None, help='System prompt override passed to the model')
@@ -903,10 +943,14 @@ def main():
     parser.add_argument('--port', type=int, default=None, help='Port to listen on; auto-increments if already in use (default: 8000)')
     parser.add_argument('--skips', nargs='+', default=['(?m)^\\[SUGGESTION MODE[\\s\\S]*', '(?m)^<system-reminder>[\\s\\S]*?^</system-reminder>\\s*'], help='Regex patterns stripped from model output before it is returned to the client')
     parser.add_argument('--stream', default=None, help='File to stream log into')
-    parser.add_argument('--notui', action='store_true', help='Use simple terminal REPL instead of TUI')
+    parser.add_argument('--bare', action='store_true', help='Use simple terminal REPL instead of TUI')
     args, leash_args = parser.parse_known_args()
     logger.debug(f'args={args!r} leash_args={leash_args!r}')
+    if args.engine == 'batch' and args.leash not in ('none', 'noapi'):
+        parser.error('--engine batch only supports --leash none or --leash noapi for now')
     cache = os.path.abspath(args.cache)
+    port = args.port if args.port is not None else 8000
+    fixed_port = args.port is not None
     with tempfile.TemporaryDirectory(dir='/tmp') as _home:
         env = os.environ.copy()
         home = Path(_home)
@@ -915,18 +959,28 @@ def main():
         env['HOME'] = _home
         env['SHELL'] = '/bin/bash'
         env['PWD'] = cwd
-        server, url = serve(host=args.host, port=args.port if args.port is not None else 8000, model=args.model, cache=cache, system=None if args.leash in ('none', 'noapi') else args.system, tools=args.tools, skips=args.skips, fixed_port=args.port is not None, gwt=gwt)
-        if args.leash == 'none':
-            try:
-                server.serve_forever()
-            except KeyboardInterrupt:
-                print('\nShutting down server...')
-                server.server_close()
+        if args.engine == 'batch':
+            server, url = _serve_batch(args.host, port, args.model, cache_dir=cache, fixed_port=fixed_port)
         else:
-            threading.Thread(target=server.serve_forever, daemon=True).start()
+            server, url = _serve_cache(host=args.host, port=port, model=args.model, cache=cache, system=None if args.leash in ('none', 'noapi') else args.system, tools=args.tools, skips=args.skips, fixed_port=fixed_port, gwt=gwt)
+        if args.leash == 'none':
+            if args.engine == 'batch':
+                try:
+                    threading.Event().wait()
+                except KeyboardInterrupt:
+                    print('\nShutting down server...')
+            else:
+                try:
+                    server.serve_forever()
+                except KeyboardInterrupt:
+                    print('\nShutting down server...')
+                    server.server_close()
+        else:
+            if args.engine == 'cache':
+                threading.Thread(target=server.serve_forever, daemon=True).start()
             if args.leash == 'noapi':
                 from .repl import run_repl
-                run_repl(base_url=url, api=args.leash, repo=cwd, env=env, system=args.system, tool_names=args.tools, sdir=args.skill, init_prompt=args.prompt, resume=args.resume, stream=args.stream, notui=args.notui)
+                run_repl(base_url=url, api=args.leash, repo=cwd, env=env, system=args.system, tool_names=args.tools, sdir=args.skill, init_prompt=args.prompt, resume=args.resume, stream=args.stream, bare=args.bare)
             else:
                 env['GOOGLE_GEMINI_BASE_URL'] = url
                 env['GEMINI_API_KEY'] = 'mc'

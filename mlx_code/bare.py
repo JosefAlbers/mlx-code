@@ -110,6 +110,7 @@ class SimpleRepl:
                 if out_text:
                     self._write_delta(prefix + out_text, 'tool_result')
                 self._last_stream_type = t
+                print()
             elif t == 'commit':
                 self._pending_nls = 0
                 self._awaiting_content = False

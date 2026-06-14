@@ -11,7 +11,7 @@ A Git-native coding agent that can run entirely on your Mac. No API keys, no clo
 ```
 Conversation tree (nodes = git commits with embedded chat history)
 
-  main ──●──●──●──●──●──●──●──●──●──●
+  main ──●──●──●──●──●──●──●──●──●──●──●──●──●──●
             │        │
             │        └── branch-1 ──●──●──●
             │                          │ ┌────────────┐
@@ -30,21 +30,21 @@ REPL tabs (each tab = a git branch + agent)    │
 │  └──────┘  └────┬─────┘  └──────────┘  └────────────┘  │
 └─────────────────┼──────────────────────────────────────┘
                   │
-                  ├────────────────────────────────────► each tab is an independent Agent
+                  ├─────────────────────────────────────────► Each tab is an independent Agent
                   │
-             ┌────┴─────────────────────────────────┐
-             │  Agent                               │
-             │  ┌──────────────┐  ┌──────────────┐  │
-             │  │ API:         │  │ Tools:       │  │
-             │  │ MLX (local)  │  │ Read  Write  │  │
-             │  │ Claude       │  │ Edit  Bash   │  │
-             │  │ Gemini       │  │ Grep  Find   │  │
-             │  │ OpenAI       │  │ Ls  Skill    │  │
-             │  └──────────────┘  │ Agent ───────┼──┼───► spawns child Agent
-             │                    └──────────────┘  │     (each with own tools + worktree + etc)
-             │  Git worktree                        │  
-             │  (isolation + session state)         │ 
-             └──────────────────────────────────────┘
+             ┌────┴─────────────────────────────────────┐
+             │  Agent                                   │
+             │  ┌────────────────┐  ┌────────────────┐  │
+             │  │ API:           │  │ Tools:         │  │
+             │  │ Local (mlx-lm) │  │ Read    Write  │  │
+             │  │ Claude         │  │ Edit    Bash   │  │
+             │  │ Gemini         │  │ Grep    Find   │  │
+             │  │ OpenAI         │  │ Ls      Skill  │  │
+             │  └────────────────┘  │ Agent ─────────┼──┼───► Spawns child Agent
+             │                      └────────────────┘  │     (each with own tools + worktree + etc)
+             │  Git worktree                            │  
+             │  (isolation + session state)             │ 
+             └──────────────────────────────────────────┘
 ```
 
 Each layer is importable and composable on its own. A commit records state, a branch records an alternative path, and a tab is just a live view over an `Agent`.
@@ -62,10 +62,15 @@ result = await agent.run('refactor utils.py to use dataclasses')
 ## Quick start
 
 ```bash
+# ephemeral run (no installation)
+uvx --from mlx-code mlc
+
+# or install into the current environment
 pip install mlx-code
-mlc                              # launch with local MLX model
+
+# launch
+mlc                              # with a local MLX model
 mlc-run --api gemini             # or use a remote provider
-mlc-run --api deepseek --model deepseek-v4-flash
 ```
 
 That's it. The first run starts a local inference server and drops you into the REPL.
@@ -87,11 +92,11 @@ That's it. The first run starts a local inference server and drops you into the 
 
 **Git is the database.** When the agent makes file changes, they’re committed to a git worktree with the full conversation embedded in the commit message. Resume any past session by hash, branch from any checkpoint, and inspect the agent timeline with `git log`. No proprietary state files, just Git. 
 
-**Your working directory is never at risk.** The agent operates inside a `git worktree`, not your checkout. It can make a mess, and you can inspect or discard it without ever touching `main`.
-
-**Built-in safety nets.** Subprocess environment variables go through an explicit allowlist, so secrets in your shell are never leaked to agent-spawned processes.
+**Built-in safety nets.** Your working directory is never at risk. The agent operates inside a `git worktree`, not your checkout. It can make a mess, and you can inspect or discard it without ever touching `main`. Subprocess environment variables go through an explicit allowlist, so secrets in your shell are never leaked to agent-spawned processes.
 
 **Batteries included.** Everything ships in one pip install: the MLX inference engine, the multi-protocol API server, the agent loop, the tools, and the TUI. No llama.cpp, no ollama, no vLLM bridge to find and configure. And the server natively speaks OpenAI, Anthropic, Gemini, and Codex wire formats simultaneously, so `claude`, `codex`, and `gemini` CLIs can all work against your local model without a translation layer.
+
+**Continuous batching.** The local inference server runs a continuous batching engine that processes multiple sequences concurrently. When you spawn parallel agents (eg, multiple tabs, `asyncio.gather` pipelines, or delegated sub-tasks) they all share the same GPU context and are stepped together each tick. A prefix cache persists KV snapshots to disk, so repeated system prompts and conversation prefixes are prefilled once and reused across sessions. No request queueing, no waiting for the previous agent to finish.
 
 ---
 
@@ -130,12 +135,12 @@ agent.messages = messages
 await agent.run("now add unit tests")
 ```
 
-Branch from any point in the conversation — each branch gets its own worktree:
+Branch from any point in the conversation. Each branch gets its own worktree:
 
 ```
 /branch                      # branch from current state
 /branch --rev 2              # branch from the 2nd user turn
-/branch --rev 3 --as-worktree try different approach
+/branch --rev 3 make it use httpx instead
 ```
 
 Since it's just git, you can inspect the timeline outside the REPL:
@@ -200,6 +205,43 @@ Reliability comes from specialization plus constraint. A read-only reviewer can'
 
 ---
 
+## Continuous batching
+
+The local server can run multiple inference sequences concurrently inside a single batch step. Instead of a global lock that serialises one request at a time, the batching engine maintains a live set of active sequences and yields tokens for all of them on every step.
+
+```bash
+mlc --engine batch            # continuous batching + built-in REPL
+```
+
+This unlocks true parallelism for multi-agent workloads:
+
+```python
+import asyncio
+from mlx_code.repl import Agent
+
+async def main():
+    agents = [Agent() for _ in range(4)]
+    await asyncio.gather(*[
+        a.run(f"Research topic: {t}")
+        for a, t in zip(agents, ["consensus", "cryptography", "networking", "storage"])
+    ])
+
+asyncio.run(main())
+```
+
+All four agents generate simultaneously inside the same batch. No sequential blocking.
+
+### Health endpoint
+
+```bash
+curl http://127.0.0.1:8000/health
+# {"status":"ok","model":"mlx-community/Qwen3.5-4B-OptiQ-4bit","active_sequences":2,"prefix_cache_files":5}
+```
+
+`active_sequences` shows how many agents are generating right now; `prefix_cache_files` shows how many prefix KV snapshots are stored on disk.
+
+---
+
 ## Command Line
 
 ### `mlc`: local server + harness
@@ -207,19 +249,19 @@ Reliability comes from specialization plus constraint. A read-only reviewer can'
 Starts the MLX inference server and launches the built-in TUI harness against it.
 
 ```bash
-# Default: local server + default TUI
+# Default: local server + default harness
 mlc
 
-# Use a simple terminal REPL instead of the TUI
-mlc --notui
+# Continuous batching mode (default is sequential caching mode)
+mlc --engine batch
+
+# Server only, no harness
+mlc --leash none
 
 # Use a different harness (routes traffic through the local server)
 mlc --leash claude
 mlc --leash gemini
 mlc --leash codex
-
-# Server only, no harness
-mlc --leash none
 
 # Specify a model
 mlc --model mlx-community/Qwen3.5-4B-OptiQ-4bit
@@ -271,7 +313,7 @@ mlc-run --api codex
 echo "explain lsp.py" | mlc-run -a deepseek | cat - PLAN.md | mlc-run --url http://localhost:9000
 
 # Simple terminal REPL (no TUI)
-mlc-run --notui
+mlc-run --bare
 ```
 
 ---
@@ -396,18 +438,19 @@ agent = Agent(extra_tool_classes=[LiveDBTool], tool_names=["QueryDB"])
 
 | Command | Description |
 |---|---|
-| `/help` | Show command reference |
-| `/clear [--config F]` | Clear conversation; `--config` reloads agent from a JSON/YAML file |
-| `/history [--raw]` | Show conversation transcript; `--raw` shows the raw API message log |
-| `/diff [--all]` | Show a side-by-side diff of changes in the worktree |
-| `/errors` | Show timestamped error log for the current tab |
-| `/tools` | List active tools |
 | `/branch [--rev N] [prompt]` | Open a new branch tab from the current (or earlier) checkpoint |
+| `/diff [--all]` | Show a side-by-side diff of changes in the worktree |
+| `/clear [--config F]` | Clear conversation; `--config` reloads agent from a JSON/YAML file |
+| `/tab [N]` | Jump to tab N |
+| `/history [--raw]` | Show conversation transcript; `--raw` shows the raw API message log |
+| `/tools` | List active tools |
 | `/abort` | Abort the running agent |
+| `/errors` | Show timestamped error log for the current tab |
 | `/export [path]` | Export session to JSON |
 | `/exit [--all]` | Close branch tab, or exit the app |
-| `!command` | Run a shell command; output captured in the TUI |
-| `$command` | Run an interactive command (TUI suspends, terminal handed to process) |
+| `/help` | Show command reference |
+| `!command` | Run a shell command; output captured in the TUI (eg, `ls`, `cat hello.c`) |
+| `$command` | Run an interactive command (eg, `vim`, `yazi`, `less hello.c`) |
 
 ### Key bindings
 
@@ -417,7 +460,7 @@ agent = Agent(extra_tool_classes=[LiveDBTool], tool_names=["QueryDB"])
 | `Ctrl-J` | Insert newline |
 | `Ctrl-1` … `Ctrl-9` | Jump to tab N |
 | `Ctrl-,` / `Ctrl-.` | Cycle through tabs |
-| `Ctrl-C` | Abort running agent |
+| `Ctrl-C` | Clear input, or abort running agent |
 | `Ctrl-D` | Close branch tab, or exit app |
 | `Ctrl-R` | Recall last prompt into editor |
 
@@ -435,7 +478,7 @@ agent = Agent(extra_tool_classes=[LiveDBTool], tool_names=["QueryDB"])
 | `Skill` | Retrieve named skill instructions from config |
 | `Agent` | Spawn an autonomous sub-agent for delegated work |
 
-All file tools enforce path sandboxing — the agent cannot read or write outside the worktree.
+All file tools enforce path sandboxing. The agent cannot read or write outside the worktree.
 
 ### Backends
 

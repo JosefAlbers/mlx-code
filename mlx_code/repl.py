@@ -980,10 +980,10 @@ async def _stream_to_stdout(agent: Agent, user_input: str) -> None:
     if text:
         print(text)
 
-async def repl(agent, init_prompt=None, notui=False):
+async def repl(agent, init_prompt=None, bare=False):
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
-    if notui and is_tty:
-        from .ntui import SimpleRepl
+    if bare and is_tty:
+        from .bare import SimpleRepl
         sr = SimpleRepl(agent, init_prompt=init_prompt)
         await sr.run()
         return None
@@ -1025,7 +1025,7 @@ _AGENT_ENV_ALLOWLIST: re.Pattern = re.compile('\n    ^(\n    # ── Execution 
 def _make_agent_env(base: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in base.items() if _AGENT_ENV_ALLOWLIST.match(k)}
 
-def run_repl(*, base_url=None, model=None, api: Literal['claude', 'codex', 'gemini', 'deepseek', 'noapi']='noapi', system='', sdir=None, skills=None, env=None, tool_names=None, extra_tool_classes=None, api_key=None, gwt=None, ctx=None, init_prompt=None, resume_messages=None, repo=None, resume=None, stream=None, verbose_transcript=False, notui=False):
+def run_repl(*, base_url=None, model=None, api: Literal['claude', 'codex', 'gemini', 'deepseek', 'noapi']='noapi', system='', sdir=None, skills=None, env=None, tool_names=None, extra_tool_classes=None, api_key=None, gwt=None, ctx=None, init_prompt=None, resume_messages=None, repo=None, resume=None, stream=None, verbose_transcript=False, bare=False):
     repo = os.path.abspath(repo or os.getcwd())
     with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as _home:
         if gwt is None:
@@ -1064,7 +1064,7 @@ def run_repl(*, base_url=None, model=None, api: Literal['claude', 'codex', 'gemi
             print(f'[resumed {len(resume_messages)} messages from checkpoint]')
         app_instance = None
         try:
-            app_instance = asyncio.run(repl(agent, init_prompt=init_prompt, notui=notui))
+            app_instance = asyncio.run(repl(agent, init_prompt=init_prompt, bare=bare))
         finally:
             if log_fp:
                 log_fp.close()
@@ -1103,7 +1103,7 @@ def main():
     parser.add_argument('--key', default=None, help='API key')
     parser.add_argument('--stream', default=None, help='File to stream log into')
     parser.add_argument('--verbose-transcript', action='store_true', help='Reserved; not yet implemented')
-    parser.add_argument('--notui', action='store_true', help='Use simple terminal REPL instead of TUI')
+    parser.add_argument('--bare', action='store_true', help='Use simple terminal REPL instead of TUI')
     args = parser.parse_args()
     logger.debug(args)
     url, model, tool_names, api_key = (args.url, args.model, args.tools, args.key)
@@ -1117,6 +1117,6 @@ def main():
         url = 'https://generativelanguage.googleapis.com' if api_key else url
         model = 'gemini-3.1-flash-lite' if model is None else model
         tool_names = [] if tool_names is None else tool_names
-    run_repl(api=args.api, system=args.system, repo=args.cwd, model=model, base_url=url, tool_names=tool_names, sdir=args.skill, api_key=api_key, init_prompt=args.prompt, resume=args.resume, stream=args.stream, notui=args.notui)
+    run_repl(api=args.api, system=args.system, repo=args.cwd, model=model, base_url=url, tool_names=tool_names, sdir=args.skill, api_key=api_key, init_prompt=args.prompt, resume=args.resume, stream=args.stream, bare=args.bare)
 if __name__ == '__main__':
     main()
