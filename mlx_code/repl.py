@@ -30,6 +30,7 @@ from rich.markup import escape
 from rich.markdown import Markdown
 from rich.cells import cell_len
 from rich.syntax import Syntax
+VERBOSE = False
 
 def load_agent_config(path: str) -> dict:
     path = os.path.expanduser(path)
@@ -231,12 +232,16 @@ def append_to_history_table(tbl: Table, messages: list[dict]) -> None:
                 prefix, style = ('◌', 'dim italic')
             elif role == 'toolResult':
                 prefix, style = ('→', 'dim yellow')
+                if not VERBOSE:
+                    text = ''
             elif b_type == 'toolCall':
                 prefix, style = ('⚙', 'yellow')
-                args = block.get('arguments', {})
-                if isinstance(args, dict):
-                    args = json.dumps(args, ensure_ascii=False)
-                text = block.get('name', '') + ' ' + str(args)
+                text = block.get('name', '')
+                if VERBOSE:
+                    args = block.get('arguments', {})
+                    if isinstance(args, dict):
+                        args = json.dumps(args, ensure_ascii=False)
+                    text += ' ' + str(args)
             elif role == 'assistant':
                 prefix, style = ('○', '')
                 text = re.sub('\\s*<tool_call>.*?</tool_call>\\s*', '', text, flags=re.DOTALL).strip()
@@ -333,21 +338,36 @@ class Tab(Vertical):
         payload = event.get('payload', {})
         if et == 'agent_start':
             self.status = 'running'
+            self._tool_call_buf = ''
             self._stream_blocks = []
             self._command_blocks = []
             self.refresh_cache()
             self.refresh_stream()
         elif et == 'turn_start':
+            self._tool_call_buf = ''
             self._stream_blocks = []
             self._command_blocks = []
             self.refresh_stream()
         elif et == 'text_delta':
             delta = payload.get('delta', '')
             if delta:
-                if self._stream_blocks and self._stream_blocks[-1].get('type') == 'text' and (not self._stream_blocks[-1].get('is_error')):
-                    self._stream_blocks[-1]['text'] += delta
+                if not VERBOSE:
+                    self._tool_call_buf = getattr(self, '_tool_call_buf', '') + delta
+                    cleaned = re.sub('<tool_call>.*?</tool_call>', '', self._tool_call_buf, flags=re.DOTALL)
+                    if '<tool_call>' in cleaned:
+                        cut = cleaned.index('<tool_call>')
+                        emit = cleaned[:cut]
+                        self._tool_call_buf = cleaned[cut:]
+                    else:
+                        emit = cleaned
+                        self._tool_call_buf = ''
                 else:
-                    self._stream_blocks.append({'type': 'text', 'text': delta})
+                    emit = delta
+                if emit:
+                    if self._stream_blocks and self._stream_blocks[-1].get('type') == 'text' and (not self._stream_blocks[-1].get('is_error')):
+                        self._stream_blocks[-1]['text'] += emit
+                    else:
+                        self._stream_blocks.append({'type': 'text', 'text': emit})
             self.refresh_stream()
         elif et == 'thinking_delta':
             delta = payload.get('delta', '')
@@ -875,6 +895,11 @@ class ReplApp(App[None]):
                 self._refresh_chrome()
             except OSError as exc:
                 self.query_one('#helpbar', HelpBar).show_error(f'Export failed: {exc}')
+        elif cmd == '/verbose':
+            global VERBOSE
+            VERBOSE = not VERBOSE
+            state = 'on' if VERBOSE else 'off'
+            tab.show_command(text, f'Verbose mode {state}.')
         elif cmd in {'/exit', '/quit'}:
             if arg == '--all':
                 self._exit_with_summary(tab)
@@ -1025,7 +1050,7 @@ _AGENT_ENV_ALLOWLIST: re.Pattern = re.compile('\n    ^(\n    # ── Execution 
 def _make_agent_env(base: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in base.items() if _AGENT_ENV_ALLOWLIST.match(k)}
 
-def run_repl(*, base_url=None, model=None, api: Literal['claude', 'codex', 'gemini', 'deepseek', 'noapi']='noapi', system='', sdir=None, skills=None, env=None, tool_names=None, extra_tool_classes=None, api_key=None, gwt=None, ctx=None, init_prompt=None, resume_messages=None, repo=None, resume=None, stream=None, verbose_transcript=False, bare=False):
+def run_repl(*, base_url=None, model=None, api: Literal['claude', 'codex', 'gemini', 'deepseek', 'noapi']='noapi', system='', sdir=None, skills=None, env=None, tool_names=None, extra_tool_classes=None, api_key=None, gwt=None, ctx=None, init_prompt=None, resume_messages=None, repo=None, resume=None, stream=None, bare=False):
     repo = os.path.abspath(repo or os.getcwd())
     with tempfile.TemporaryDirectory(dir=tempfile.gettempdir()) as _home:
         if gwt is None:
@@ -1102,11 +1127,13 @@ def main():
     parser.add_argument('--cwd', default=None, help='Working directory / git repo root')
     parser.add_argument('--key', default=None, help='API key')
     parser.add_argument('--stream', default=None, help='File to stream log into')
-    parser.add_argument('--verbose-transcript', action='store_true', help='Reserved; not yet implemented')
+    parser.add_argument('--verbose', action='store_true', help='Show raw tool calls, args, and outputs')
     parser.add_argument('--bare', action='store_true', help='Use simple terminal REPL instead of TUI')
     args = parser.parse_args()
     logger.debug(args)
     url, model, tool_names, api_key = (args.url, args.model, args.tools, args.key)
+    global VERBOSE
+    VERBOSE = args.verbose
     if args.api == 'deepseek':
         api_key = os.environ.get('DEEPSEEK_API_KEY') if api_key is None else api_key
         url = 'https://api.deepseek.com' if api_key else url

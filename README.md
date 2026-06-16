@@ -9,9 +9,9 @@ A Git-native coding agent that can run entirely on your Mac. No API keys, no clo
 ## Architecture
 
 ```
-Conversation tree (nodes = git commits with embedded chat history)
+Worktrees:
 
-  main ──●──●──●──●──●──●──●──●──●──●──●──●──●──●
+  main ──●──●──●──●──●──●──●──●──●──●──●──●──●──●───────────► Node = git commit + chat history
             │        │
             │        └── branch-1 ──●──●──●
             │                          │ ┌────────────┐
@@ -20,7 +20,7 @@ Conversation tree (nodes = git commits with embedded chat history)
             └── branch-0 ──●──●──●             │
                                                │
                                                │
-REPL tabs (each tab = a git branch + agent)    │
+Tabs:                                          ├────────────► Tab = git branch + Agent
                                                │
                                                │
 ┌──────────────────────────────────────────────┼─────────┐
@@ -30,20 +30,20 @@ REPL tabs (each tab = a git branch + agent)    │
 │  └──────┘  └────┬─────┘  └──────────┘  └────────────┘  │
 └─────────────────┼──────────────────────────────────────┘
                   │
-Agents            ├─────────────────────────────────────────► Each tab is an independent Agent
+Agents:           ├─────────────────────────────────────────► Each tab runs its own Agent
                   │
              ┌────┴─────────────────────────────────────┐
              │  Agent                                   │
              │  ┌────────────────┐  ┌────────────────┐  │
              │  │ API:           │  │ Tools:         │  │
              │  │ Local (mlx-lm) │  │ Read    Write  │  │
-             │  │ Claude         │  │ Edit    Bash   │  │
-             │  │ Gemini         │  │ Grep    Find   │  │
-             │  │ OpenAI         │  │ Ls      Skill  │  │
-             │  └────────────────┘  │ Agent ─────────┼──┼───► AgentTool to spawn a child Agent
-             │                      └────────────────┘  │     (each with own tools + worktree + etc)
-             │  Git worktree                            │  
-             │  (isolation + session state)             │ 
+             │  │ Gemini         │  │ Edit    Bash   │  │
+             │  │ Claude         │  │ Grep    Find   │  │
+             │  │ Codex          │  │ Ls      Skill  │  │
+             │  │ DeepSeek       │  │ Agent ─────────┼──┼───► Recursively spawns sub-Agents
+             │  └────────────────┘  └────────────────┘  │     
+             │  Git worktree                            │
+             │  (isolation + session state)             │
              └──────────────────────────────────────────┘
 ```
 
