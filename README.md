@@ -2,7 +2,7 @@
 
 A Git-native coding agent that can run entirely on your Mac. No API keys, no cloud, and no data leaving your machine. Powered by Apple MLX, it turns commits, branches, and worktrees into the agent’s state, history, and execution model
 
-[![Link](https://raw.githubusercontent.com/JosefAlbers/mlx-code/main/assets/mlx-code-v0.0.20.gif)](https://youtu.be/0lkY7YQCyCo)
+<a href="https://asciinema.org/a/1257590" target="_blank"><img src="https://asciinema.org/a/1257590.svg" /></a>
 
 ---
 
