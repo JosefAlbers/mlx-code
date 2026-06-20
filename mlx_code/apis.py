@@ -75,7 +75,7 @@ class ClaudeChat:
                 out.append(blk)
             elif t == 'thinking':
                 if b['redacted']:
-                    out.append({'type': 'redacted_thinking', 'data': b['thinking']})
+                    out.append({'type': 'redacted_thinking', 'data': b.get('thinking', b.get('redacted_data', ''))})
                 else:
                     out.append({'type': 'thinking', 'thinking': b['thinking'], 'signature': b.get('signature') or ''})
             elif t == 'toolCall':
@@ -156,7 +156,7 @@ class ClaudeChat:
                                     msg['content'].append({'type': 'thinking', 'thinking': '', 'signature': None, 'redacted': False})
                                 elif bt == 'redacted_thinking':
                                     _idx[idx] = len(msg['content'])
-                                    msg['content'].append({'type': 'thinking', 'thinking': '', 'signature': None, 'redacted': True})
+                                    msg['content'].append({'type': 'thinking', 'redacted_data': blk.get('data', ''), 'signature': None, 'redacted': True})
                                 elif bt == 'tool_use':
                                     _idx[idx] = len(msg['content'])
                                     msg['content'].append({'type': 'toolCall', 'id': blk['id'], 'name': blk['name'], 'arguments': {}})

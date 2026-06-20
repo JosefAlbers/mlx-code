@@ -148,16 +148,17 @@ class Agent:
                             r['content'].insert(0, {'type': 'text', 'text': warn})
             self.messages.extend(results)
             await self._emit({'type': 'tool_results_ready', 'payload': {}})
-            new_gwt, diff_stat = commit_worktree(self.ctx['gwt'], self.messages)
-            self.ctx['gwt'] = new_gwt
-            if diff_stat:
-                sha = new_gwt.commit[:8] if new_gwt else ''
-                self.messages.append({'role': 'commit', 'content': f'[{sha}]\n{diff_stat}', 'sha': sha})
-                await self._emit({'type': 'commit', 'payload': {'diff_stat': diff_stat, 'sha': sha}})
             if self._signal and self._signal.is_set():
                 final['stop_reason'] = 'aborted'
                 break
+        new_gwt, diff_stat = commit_worktree(self.ctx['gwt'], self.messages)
+        self.ctx['gwt'] = new_gwt
+        if diff_stat:
+            sha = new_gwt.commit[:8] if new_gwt else ''
+            self.messages.append({'role': 'commit', 'content': f'[{sha}]\n{diff_stat}', 'sha': sha})
+            await self._emit({'type': 'commit', 'payload': {'diff_stat': diff_stat, 'sha': sha}})
         await self._emit({'type': 'agent_end', 'payload': {'message': final}})
+        logger.debug(json.dumps(self.messages, indent=2, ensure_ascii=False))
         return final
 
     async def _execute_tools(self, calls: list[dict]) -> list[dict]:
@@ -237,7 +238,7 @@ class UIAdapter(Protocol):
 
     def exit_app(self, summary: list[dict]) -> None:
         ...
-HELP_TEXT = '\nCommands:\n/help               show this message\n/clear [--config F] clear conversation; --config reconfigures agent from YAML/JSON\n/history            show full conversation transcript\n/history --raw      show raw API message log (debug)\n/diff [--all]       show side-by-side diff of changes\n/errors             show timestamped error log for this tab\n/tools              list active tools\n/branch [--rev N] [--no-worktree] [prompt]\n                    open a branch tab; optional prompt runs immediately\n/branches           list all tabs/branches\n/abort              abort the running agent\n/export [path]      export session to JSON\n/verbose            toggle verbose mode (show raw tool calls and output)\n/exit  /quit [--all] close branch tab, or exit the app\n!command            run shell command in worktree (output captured)\n$command            run interactive shell command (terminal handed to process)\n                    e.g.  !ls  !git diff  !cat file.py\n                          $vim file.py  $yazi  $less log.txt\n\nKeys (TUI only):\nEnter               submit\nCtrl-J              insert newline in editor\nCtrl-1 … Ctrl-9     jump directly to tab N\nCtrl-, / Ctrl-.     cycle through tabs\nCtrl-C              abort running agent\nCtrl-D              close branch tab (exit app if last tab)\nCtrl-R              recall last prompt into editor\n'
+HELP_TEXT = '\nCommands:\n/help               show this message\n/clear [--config F] clear conversation; --config reconfigures agent from YAML/JSON\n/history            show full conversation transcript\n/history --raw      show raw API message log (debug)\n/diff [--all]       show side-by-side diff of changes\n/errors             show timestamped error log for this tab\n/tools              list active tools\n/branch [--rev N] [--no-worktree] [prompt]\n                    open a branch tab; optional prompt runs immediately\n/branches           list all tabs/branches\n/abort              abort the running agent\n/export [path]      export session to JSON\n/verbose            toggle verbose mode (show raw tool calls and output)\n/merge              merge this branch into its parent tab, then close\n/exit  /quit [--all] close branch tab, or exit the app\n!command            run shell command in worktree (output captured)\n$command            run interactive shell command (terminal handed to process)\n                    e.g.  !ls  !git diff  !cat file.py\n                          $vim file.py  $yazi  $less log.txt\n\nKeys (TUI only):\nEnter               submit\nCtrl-J              insert newline in editor\nCtrl-1 … Ctrl-9     jump directly to tab N\nCtrl-, / Ctrl-.     cycle through tabs\nCtrl-C              abort running agent\nCtrl-D              close branch tab (exit app if last tab)\nCtrl-R              recall last prompt into editor\n'
 
 class CommandEngine:
 
@@ -289,6 +290,15 @@ class CommandEngine:
             self._unsubscribers[key]()
             del self._unsubscribers[key]
 
+    def _find_parent_tab(self, tab: TabModel) -> TabModel | None:
+        if not tab.index_path:
+            return None
+        parent_path = tab.index_path[:-1]
+        for t in self.tabs:
+            if t.index_path == parent_path:
+                return t
+        return None
+
     async def handle_input(self, text: str) -> None:
         text = text.strip()
         if not text:
@@ -310,7 +320,7 @@ class CommandEngine:
         cmd, _, arg = text.partition(' ')
         cmd = cmd.lower().strip()
         arg = arg.strip()
-        handlers = {'/help': self._cmd_help, '/clear': self._cmd_clear, '/history': self._cmd_history, '/diff': self._cmd_diff, '/errors': self._cmd_errors, '/tools': self._cmd_tools, '/abort': self._cmd_abort, '/branch': self._cmd_branch, '/branches': self._cmd_branches, '/tab': self._cmd_tab, '/export': self._cmd_export, '/verbose': self._cmd_verbose, '/exit': self._cmd_exit, '/quit': self._cmd_exit}
+        handlers = {'/help': self._cmd_help, '/clear': self._cmd_clear, '/history': self._cmd_history, '/diff': self._cmd_diff, '/errors': self._cmd_errors, '/tools': self._cmd_tools, '/abort': self._cmd_abort, '/branch': self._cmd_branch, '/branches': self._cmd_branches, '/tab': self._cmd_tab, '/export': self._cmd_export, '/verbose': self._cmd_verbose, '/merge': self._cmd_merge, '/exit': self._cmd_exit, '/quit': self._cmd_exit}
         handler = handlers.get(cmd)
         if handler:
             await handler(arg)
@@ -330,6 +340,9 @@ class CommandEngine:
                 self.ui.show_error(f'Config error: {e}')
                 return
             tab = self.active_tab
+            if tab.is_running:
+                self.ui.show_error('Agent is running — /abort first before /clear --config.')
+                return
             old = tab.agent
             new_ctx = {k: v for k, v in old.ctx.items() if k != 'agent'}
             new_agent = Agent(system=cfg.get('system'), api=cfg.get('api'), model=cfg.get('model'), api_key=cfg.get('api_key'), base_url=cfg.get('base_url'), tool_names=cfg.get('tools'), extra_tool_classes=old._extra_tool_classes, ctx=new_ctx)
@@ -557,6 +570,36 @@ class CommandEngine:
         state = 'on' if self.verbose else 'off'
         self.ui.show_command_result('/verbose', f'Verbose mode {state}.')
 
+    async def _cmd_merge(self, arg: str) -> None:
+        tab = self.active_tab
+        if tab.is_main:
+            self.ui.show_error('Cannot /merge the main tab — it has no parent.')
+            return
+        if tab.is_running:
+            self.ui.show_error('Agent is running — /abort first.')
+            return
+        parent = self._find_parent_tab(tab)
+        if parent is None:
+            self.ui.show_error(f'Cannot find parent tab for {tab.title!r}.')
+            return
+        child_gwt = tab.agent.ctx.get('gwt')
+        parent_gwt = parent.agent.ctx.get('gwt')
+        if child_gwt is None or parent_gwt is None:
+            self.ui.show_error('Both tabs need git worktrees to merge.')
+            return
+        commit_worktree(child_gwt, tab.agent.messages)
+        from .gits import merge_branch_into_worktree
+        success, msg = merge_branch_into_worktree(parent_gwt, child_gwt)
+        if not success:
+            self.ui.show_error(f'Merge failed: {msg}')
+            return
+        new_parent_gwt, diff_stat = commit_worktree(parent_gwt, parent.agent.messages)
+        parent.agent.ctx['gwt'] = new_parent_gwt
+        self.ui.show_command_result('/merge', f'Merged {tab.title!r} into {parent.title!r}.\n' + (f'{diff_stat}' if diff_stat else '(no changes)'))
+        self._do_close_or_exit()
+        parent_idx = self.tabs.index(parent)
+        self.switch_tab(parent_idx)
+
     async def _cmd_exit(self, arg: str) -> None:
         if arg == '--all':
             summary = self._build_exit_summary()
@@ -636,6 +679,12 @@ class CommandEngine:
             tab = self.active_tab
             removed_index = self.active_index
             self.detach_agent(tab)
+            gwt_ref = tab.agent.ctx.get('gwt')
+            if gwt_ref and getattr(gwt_ref, 'worktree', None):
+                try:
+                    cleanup_worktree(gwt_ref, remove_branch=True)
+                except Exception:
+                    logger.error('Failed worktree cleanup')
             self.tabs.pop(removed_index)
             if self.active_index >= len(self.tabs):
                 self.active_index = len(self.tabs) - 1

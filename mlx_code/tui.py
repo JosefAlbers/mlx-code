@@ -234,7 +234,6 @@ class Tab(Vertical):
                     self._stream_blocks.append({'type': 'thinking', 'text': delta})
             self.refresh_stream()
         elif et == 'tool_start':
-            self._stream_blocks.append({'type': 'toolCall', 'name': payload.get('name', 'tool'), 'arguments': payload.get('args', {}), 'id': 'streaming'})
             self.refresh_stream()
         elif et == 'tool_end':
             if payload.get('is_error'):

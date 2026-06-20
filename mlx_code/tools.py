@@ -386,6 +386,7 @@ class AgentTool(Tool):
     parameters = AgentParams
 
     async def execute(self, params: AgentParams, signal=None) -> dict:
+        from gits import create_worktree, commit_worktree, merge_branch_into_worktree
         parent = self.ctx['agent']
         overrides = {}
         if params.api is not None:
@@ -394,11 +395,23 @@ class AgentTool(Tool):
             overrides['system'] = params.system
         overrides['tool_names'] = params.tools
         child = parent.spawn(**overrides)
+        parent_gwt = parent.ctx.get('gwt')
+        parent_cwd = parent.ctx.get('cwd', os.getcwd())
+        repo_dir = parent_gwt.worktree if parent_gwt else parent_cwd
+        child_gwt = create_worktree(repo_dir, prefix='subagent')
+        if child_gwt is None:
+            return tout('Agent failed: could not create isolated worktree. Check .log.json for git errors.', True)
+        child.ctx['gwt'] = child_gwt
+        child.ctx['cwd'] = child_gwt.worktree
+        if 'env' in child.ctx:
+            child.ctx['env']['PWD'] = child_gwt.worktree
         if '_stream_log_fp' in parent.ctx:
             from .stream_log import StreamLogger
             StreamLogger.attach_to_child(child, parent.ctx, tool_name=f'sub-agent-{''.join(random.choices(string.ascii_letters + string.digits, k=2))}')
         try:
             result = await child.run(params.task)
+            commit_worktree(child_gwt, child.messages)
+            merge_branch_into_worktree(parent_gwt, child_gwt)
             texts = [b.get('text', '') for b in result['content'] if b.get('type') == 'text']
             combined = ''.join(texts).strip()
             if not combined:

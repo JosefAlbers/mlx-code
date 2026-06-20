@@ -445,6 +445,7 @@ agent = Agent(extra_tool_classes=[LiveDBTool], tool_names=["QueryDB"])
 | `/abort` | Abort the running agent |
 | `/errors` | Show timestamped error log for the current tab |
 | `/export [path]` | Export session to JSON |
+| `/merge` | Merge current branch into parent tab |
 | `/exit [--all]` | Close branch tab, or exit the app |
 | `/help` | Show command reference |
 | `!command` | Run a shell command; output captured in the TUI (eg, `ls`, `cat hello.c`) |

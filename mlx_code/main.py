@@ -387,10 +387,11 @@ def is_stuck(tokens, pattern_size=100, min_repeats=3):
     if len(tokens) < pattern_size * min_repeats:
         return False
     pattern = tuple(tokens[-pattern_size:])
+    window = tokens[-(pattern_size * min_repeats + pattern_size):]
     positions = []
-    limit = len(tokens) - pattern_size
+    limit = len(window) - pattern_size
     for i in range(limit):
-        if tuple(tokens[i:i + pattern_size]) == pattern:
+        if tuple(window[i:i + pattern_size]) == pattern:
             positions.append(i)
     if len(positions) < min_repeats:
         return False

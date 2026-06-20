@@ -350,3 +350,20 @@ def get_branch_base_sha(worktree: str) -> str | None:
                 pass
     root_sha = _git(worktree, 'rev-list', '--max-parents=0', 'HEAD', check=False)
     return root_sha or None
+
+def merge_branch_into_worktree(parent_gwt, child_gwt) -> tuple[bool, str]:
+    if parent_gwt is None or child_gwt is None:
+        out = f'Not git: parent_gwt={parent_gwt!r} child_gwt={child_gwt!r}'
+        logger.debug(out)
+        return (False, out)
+    try:
+        out = _git(parent_gwt.worktree, 'merge', '--no-edit', '--no-ff', child_gwt.branch)
+        logger.info(out)
+        return (True, out)
+    except GitError as exc:
+        logger.error('Failed merge')
+        try:
+            _git(parent_gwt.worktree, 'merge', '--abort', check=False)
+        except Exception as _exc:
+            logger.error('Failed merge --abort')
+        return (False, str(exc))

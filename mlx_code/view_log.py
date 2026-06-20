@@ -597,7 +597,7 @@ def tui(stdscr, entries, log_file, initial_filter='', initial_visible=None):
 def main():
     parser = argparse.ArgumentParser(description='TUI viewer for JSON log files')
     parser.add_argument('logfile', nargs='?', default='.log.json', help='Path to log file (default: .log.json)')
-    parser.add_argument('-f', '--filter', default=f'lvl:10;file:main,bats,repl,bare,gits,apis,tools', help='Initial filter string (same syntax as in UI)')
+    parser.add_argument('-f', '--filter', default=f'lvl:10;file:main,bats,repl,bare,tui,gits,apis,tools', help='Initial filter string (same syntax as in UI)')
     parser.add_argument('-o', '--out', dest='out', metavar='FILE', help='Write marked entries to FILE (JSON lines format) instead of stdout')
     args = parser.parse_args()
     log_path = args.logfile
