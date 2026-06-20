@@ -510,8 +510,18 @@ mlc --leash claude       # claude code
     - subdomain: jjoe
     - domain: mlx-code.com
     - service url: http://host.containers.internal:8080
+
+[protect & connect]-[zero trust]-[access controls]-[applications]-[create new application]-[self-hosted and private]:
+    - subdomain: jjoe
+    - domain: mlx-code.com
+    - [create new policy]
+        - policy name: Kaputt
+        - action: Allow
+        - [policy rules]-[(or) include]-[selector is]
+
 mlc --host 0.0.0.0 --engine batch --web &
 podman run cloudflare/cloudflared:latest tunnel --no-autoupdate run --token $JJ_CFD_TOKEN
+
 phone http://jjoe.mlx-code.com
 ```
 
